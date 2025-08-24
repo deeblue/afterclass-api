@@ -13,6 +13,7 @@
 
 export interface Env {
   DB: D1Database;
+  AFTERCLASS_KV?: KVNamespace; //
   KV: KVNamespace;
   ALLOW_ORIGIN: string;        // 逗號分隔的允許清單，如 "https://x.pages.dev,https://study.g4z.cloudflare"
   OPENAI_API_KEY?: string;     // wrangler secret put OPENAI_API_KEY
@@ -20,6 +21,7 @@ export interface Env {
 }
 
 /* ----------------------- 小工具 & 基礎 ----------------------- */
+
 function pickOrigin(allowList: string, reqOrigin: string | null): string {
   if (!allowList) return "*";  // 若未設定，開放（建議正式環境一定要設）
   const list = allowList.split(",").map(s => s.trim()).filter(Boolean);
@@ -29,10 +31,11 @@ function pickOrigin(allowList: string, reqOrigin: string | null): string {
 const corsHeaders = (o: string) => ({
   "Access-Control-Allow-Origin": o,
   "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization"
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Max-Age": "86400",
 });
 const j = (data: unknown, status = 200, o = "*") =>
-  new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json", ...corsHeaders(o) } });
+	new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders(o) } });
 const no = (o: string) => new Response(null, { status: 204, headers: corsHeaders(o) });
 
 function bearerOk(req: Request, env: Env): boolean {
@@ -43,13 +46,16 @@ function bearerOk(req: Request, env: Env): boolean {
 
 /** 極簡 KV 節流：每 IP 每分鐘最多 N 次 */
 async function rateLimit(env: Env, key: string, limit = 60, ttlSec = 60): Promise<boolean> {
+  const kv = env.AFTERCLASS_KV ?? env.KV;
+  if (!kv) return true; // 沒有 KV 綁定時，不做節流，避免 throw
   const bucket = `rl:${key}:${Math.floor(Date.now() / (ttlSec * 1000))}`;
-  const v = await env.KV.get(bucket);
+  const v = await kv.get(bucket);
   const n = v ? parseInt(v, 10) : 0;
   if (n >= limit) return false;
-  await env.KV.put(bucket, String(n + 1), { expirationTtl: ttlSec + 5 });
+  await kv.put(bucket, String(n + 1), { expirationTtl: ttlSec + 5 });
   return true;
 }
+
 
 /* ----------------------- 判題邏輯（後端） ----------------------- */
 type Answer =
@@ -184,11 +190,13 @@ async function gptEvaluate(env: Env, prompt: string, preferStrong = false, maxTo
 
 /* ----------------------- 主處理器 ----------------------- */
 export default {
-	async fetch(req: Request, env: Env) {
-		const url = new URL(req.url);
+	async fetch(req: Request, env: Env): Promise<Response> {
 		const origin = pickOrigin(env.ALLOW_ORIGIN, req.headers.get("Origin"));
 
-	    if (req.method === "OPTIONS") return no(origin);
+		try {
+		const url = new URL(req.url);
+
+		if (req.method === "OPTIONS") return no(origin);
 
 		// 健康檢查
 		if (url.pathname === "/api/health" && req.method === "GET") {
@@ -383,5 +391,10 @@ ${JSON.stringify(steps)}
 	    }
 		// 無匹配
     	return j({ error: "not_found" }, 404, origin);
+	} catch (e:any) {
+		// 最後防線：任何未捕捉錯誤都回 JSON + CORS
+		const origin = pickOrigin(env.ALLOW_ORIGIN, req.headers.get("Origin"));
+		return j({ error: "internal_error", detail: String(e?.message || e) }, 500, origin);
+	}
 	}
 } satisfies ExportedHandler<Env>;

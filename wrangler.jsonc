@@ -13,7 +13,7 @@
 	"d1_databases": [
     	{ "binding": "DB", "database_name": "afterclass_db", "database_id": "b837c198-e4d5-4ebd-b732-4c81ace75b96" }
   	],
-  	"vars": { "ALLOW_ORIGIN": "http://localhost:8787, " },	// "https://afterclass-api.pages.dev"
+  	"vars": { "ALLOW_ORIGIN": "https://afterclass.pages.dev, http://localhost:5173" },
 	"kv_namespaces": [
 		{
 			"binding": "AFTERCLASS_KV",
