@@ -21,6 +21,7 @@ export interface Env {
 }
 
 /* ----------------------- 小工具 & 基礎 ----------------------- */
+const nvl = <T,>(v: T): T | null => (v === undefined ? null : v);
 
 function pickOrigin(allowList: string, reqOrigin: string | null): string {
   if (!allowList) return "*";  // 若未設定，開放（建議正式環境一定要設）
@@ -55,7 +56,6 @@ async function rateLimit(env: Env, key: string, limit = 60, ttlSec = 60): Promis
   await kv.put(bucket, String(n + 1), { expirationTtl: ttlSec + 5 });
   return true;
 }
-
 
 /* ----------------------- 判題邏輯（後端） ----------------------- */
 type Answer =
@@ -270,91 +270,108 @@ export default {
 			const ip = req.headers.get("CF-Connecting-IP") || "unknown";
 			if (!(await rateLimit(env, `attempts:${ip}`, 180, 60))) return j({ error: "rate_limited" }, 429, origin);
 
+			const DEBUG = true;
+
 			try {
 				const body = await req.json().catch(() => ({}));
-				const attempts = Array.isArray(body.attempts) ? body.attempts : [];
-				if (attempts.length === 0) return j({ inserted: 0, updated: 0, duplicates: 0 }, 200, origin);
+				const attemptsIn = Array.isArray(body.attempts) ? body.attempts : [];
+				if (!attemptsIn.length) return j({ inserted: 0, updated: 0, duplicates: 0, failures: [] }, 200, origin);
+   				if (attemptsIn.length > 200) return j({ error: "too_many_attempts", limit: 200 }, 400, origin);
 
 				let inserted = 0, updated = 0, duplicates = 0;
+				const failures: Array<{i:number; reason:string}> = [];
 
-				for (const a of attempts) {
-					// 取正解
-					const itemRow = await env.DB.prepare(`SELECT id,answer,kcs FROM items WHERE id=?`).bind(a.item_id).first<any>();
-					const ans: Answer | null = itemRow?.answer ? JSON.parse(itemRow.answer) : null;
+				for (let i = 0; i < attemptsIn.length; i++) {
+					const a = attemptsIn[i];
 
-					// 後端判分（若取不到正解就用 0）
-					const serverCorrect = ans ? grade(a.raw_answer, ans) : 0;
+					try {
+						// ---- 統一安全值（「永不為 undefined」）----
+						const attempt_id = String(a?.attempt_id ?? crypto.randomUUID());
+						const user_id    = String(a?.user_id ?? "anon");
+						const item_id    = String(a?.item_id ?? "");
+						if (!item_id) throw new Error("missing_item_id");
 
-					// INSERT OR IGNORE
-					const ins = await env.DB.prepare(
-						`INSERT OR IGNORE INTO attempts
-						(attempt_id,user_id,item_id,ts,elapsed_sec,raw_answer,correct,attempts,work_url,process_json,rubric_json,eval_model,device_id,session_id)
-						VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-					).bind(
-						a.attempt_id, a.user_id, a.item_id, a.ts, a.elapsed_sec,
-						a.raw_answer != null ? JSON.stringify(a.raw_answer) : null,
-						serverCorrect,
-						a.attempts ?? 1,
-						a.work_url ?? null,
-						a.process_json != null ? JSON.stringify(a.process_json) : null,
-						a.rubric_json  != null ? JSON.stringify(a.rubric_json)  : null,
-						a.eval_model ?? null,
-						a.device_id ?? null,
-						a.session_id ?? null
-					).run();
+						const ts         = String(a?.ts ?? new Date().toISOString());
+						const elapsed    = Number(a?.elapsed_sec ?? 0);
+						const attemptsN  = Number(a?.attempts ?? 1);
+						const work_url   = nvl(a?.work_url ?? null);
+						const process_json = nvl(a?.process_json != null ? JSON.stringify(a.process_json) : null);
+						const rubric_json  = nvl(a?.rubric_json  != null ? JSON.stringify(a.rubric_json)  : null);
+						const eval_model = nvl(a?.eval_model ?? null);
+						const device_id  = nvl(a?.device_id ?? null);
+						const session_id = nvl(a?.session_id ?? null);
+						const raw_answer = nvl(a?.raw_answer != null ? JSON.stringify(a.raw_answer) : null);
 
-					if (ins.success && ins.meta.changes === 1) {
-						inserted++;
-					} else {
-						const upd = await env.DB.prepare(
-							`UPDATE attempts SET user_id=?, item_id=?, ts=?, elapsed_sec=?, raw_answer=?, correct=?, attempts=?,
-							work_url=?, process_json=?, rubric_json=?, eval_model=?, device_id=?, session_id=?
-							WHERE attempt_id=?`
+						// 取正解 + 判分
+						const itemRow = await env.DB.prepare(
+						`SELECT id, answer, kcs FROM items WHERE id=?`
+						).bind(item_id).first<any>();
+
+						const ans: Answer | null = itemRow?.answer ? JSON.parse(itemRow.answer) : null;
+						const serverCorrect = ans ? grade(a?.raw_answer, ans) : 0;
+
+						// INSERT OR IGNORE
+						const ins = await env.DB.prepare(
+							`INSERT OR IGNORE INTO attempts
+							(attempt_id,user_id,item_id,ts,elapsed_sec,raw_answer,correct,attempts,work_url,process_json,rubric_json,eval_model,device_id,session_id)
+							VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 						).bind(
-							a.user_id, a.item_id, a.ts, a.elapsed_sec,
-							a.raw_answer != null ? JSON.stringify(a.raw_answer) : null,
-							serverCorrect,
-							a.attempts ?? 1,
-							a.work_url ?? null,
-							a.process_json != null ? JSON.stringify(a.process_json) : null,
-							a.rubric_json  != null ? JSON.stringify(a.rubric_json)  : null,
-							a.eval_model ?? null,
-							a.device_id ?? null,
-							a.session_id ?? null,
-							a.attempt_id
+							attempt_id, user_id, item_id, ts, elapsed, raw_answer,
+							Number(serverCorrect ?? 0), attemptsN, work_url, process_json, rubric_json,
+							eval_model, device_id, session_id
 						).run();
-						if (upd.meta.changes === 1) updated++; else duplicates++;
-					}
 
-					// 更新 kc_stats（簡版：每題的 kcs 以 "|" 拆，逐一累計）
-					if (itemRow?.kcs) {
-						const arr = String(itemRow.kcs).split("|").map((s: string) => s.trim()).filter(Boolean);
-						for (const kc of arr) {
-							const row = await env.DB.prepare(`SELECT total_attempts,correct_attempts FROM kc_stats WHERE user_id=? AND kc=?`).bind(a.user_id, kc).first<any>();
-							if (row) {
-								const total = (row.total_attempts ?? 0) + 1;
-								const correct = (row.correct_attempts ?? 0) + (serverCorrect ? 1 : 0);
-								const rate = total ? correct / total : 0;
-								await env.DB.prepare(
-									`UPDATE kc_stats SET total_attempts=?, correct_attempts=?, correct_rate=?, streak=?, last_ts=? WHERE user_id=? AND kc=?`
-								).bind(
-									total, correct, rate,
-									serverCorrect ? ( (row.streak ?? 0) + 1 ) : 0,
-									a.ts, a.user_id, kc
-								).run();
-							} else {
-								await env.DB.prepare(
-									`INSERT INTO kc_stats(user_id,kc,w,correct_rate,total_attempts,correct_attempts,streak,last_ts)
-									VALUES(?,?,?,?,?,?,?,?)`
-								).bind(
-									a.user_id, kc, 1.0, serverCorrect ? 1.0 : 0.0, 1, serverCorrect ? 1 : 0, serverCorrect ? 1 : 0, a.ts
-								).run();
+						if (ins.success && ins.meta.changes === 1) {
+							inserted++;
+						} else {
+							const upd = await env.DB.prepare(
+								`UPDATE attempts SET user_id=?, item_id=?, ts=?, elapsed_sec=?, raw_answer=?, correct=?, attempts=?,
+								work_url=?, process_json=?, rubric_json=?, eval_model=?, device_id=?, session_id=?
+								WHERE attempt_id=?`
+							).bind(
+								user_id, item_id, ts, elapsed, raw_answer,
+								Number(serverCorrect ?? 0), attemptsN, work_url, process_json, rubric_json,
+								eval_model, device_id, session_id, attempt_id
+							).run();
+							if (upd.meta.changes === 1) updated++; else duplicates++;
+						}
+
+						// kc_stats（可選：僅當 item 有 kcs）
+						if (itemRow?.kcs) {
+							const kcsArr = String(itemRow.kcs).split("|").map((s: string) => s.trim()).filter(Boolean);
+							for (const kc of kcsArr) {
+								const row = await env.DB.prepare(
+								`SELECT total_attempts, correct_attempts, streak FROM kc_stats WHERE user_id=? AND kc=?`
+								).bind(user_id, kc).first<any>();
+
+								const isRight = !!serverCorrect;
+
+								if (row) {
+									const total = (row.total_attempts ?? 0) + 1;
+									const correct = (row.correct_attempts ?? 0) + (isRight ? 1 : 0);
+									const rate = total ? correct / total : 0;
+									const streak = isRight ? ((row.streak ?? 0) + 1) : 0;
+									await env.DB.prepare(
+										`UPDATE kc_stats SET total_attempts=?, correct_attempts=?, correct_rate=?, streak=?, last_ts=? WHERE user_id=? AND kc=?`
+									).bind(total, correct, rate, streak, ts, user_id, kc).run();
+								} else {
+									await env.DB.prepare(
+										`INSERT INTO kc_stats(user_id, kc, w, correct_rate, total_attempts, correct_attempts, streak, last_ts)
+										VALUES(?,?,?,?,?,?,?,?)`
+									).bind(user_id, kc, 1.0, isRight ? 1.0 : 0.0, 1, isRight ? 1 : 0, isRight ? 1 : 0, ts).run();
+								}
 							}
 						}
+					} catch (e: any) {
+						// 單筆失敗不影響其他資料
+						failures.push({ i, reason: String(e?.message || e) });
+						if (DEBUG) console.error("attempt row failed", i, e);
 					}
 				}
-				return j({ inserted, updated, duplicates }, 200, origin);
+				const payload = { inserted, updated, duplicates, failures };
+   				return j(payload, failures.length && DEBUG ? 207 : 200, origin); // 207: Multi-Status（提示有部份失敗）
 			} catch (e: any) {
+				if (DEBUG) console.error("attempts_bulk_failed", e);
 				return j({ error: "attempts_bulk_failed", detail: String(e?.message || e) }, 500, origin);
 			}
 		}
