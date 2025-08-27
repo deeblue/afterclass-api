@@ -10,6 +10,7 @@
  *
  * Learn more at https://developers.cloudflare.com/workers/
  */
+// import { ExportedHandler } from "@cloudflare/workers-types";
 
 export interface Env {
   DB: D1Database;
@@ -37,6 +38,7 @@ const corsHeaders = (o: string) => ({
 });
 const j = (data: unknown, status = 200, o = "*") =>
 	new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders(o) } });
+
 const no = (o: string) => new Response(null, { status: 204, headers: corsHeaders(o) });
 
 function bearerOk(req: Request, env: Env): boolean {
@@ -203,7 +205,7 @@ export default {
 			return j({ ok: true, time: new Date().toISOString() }, 200, origin);
 		}
 
-		// 題目查詢：?subject=&unit=&kc=&q=&n=&page=&random=1
+		// 題目查詢：(支援條件；預設不回 answer)
 		if (url.pathname === "/api/items" && req.method === "GET") {
 			try {
 				const subject = url.searchParams.get("subject");
@@ -213,6 +215,8 @@ export default {
 				const n = Math.max(1, Math.min(50, Number(url.searchParams.get("n") || 10)));
 				const page = Math.max(1, Number(url.searchParams.get("page") || 1));
 				const random = url.searchParams.get("random") === "1";
+				const includeAns = url.searchParams.get("include_answer") === "1";
+				const authed  = bearerOk(req, env);
 
 				let sql = `SELECT * FROM items WHERE status='published'`;
 				const params: any[] = [];
@@ -224,17 +228,21 @@ export default {
 				sql += ` LIMIT ? OFFSET ?`; params.push(n, (page - 1) * n);
 
 				const { results } = await env.DB.prepare(sql).bind(...params).all();
-				const data = (results as any[]).map(r => ({
-				id: r.id, subject: r.subject, grade: r.grade, unit: r.unit,
-				kcs: r.kcs ? String(r.kcs).split("|") : [],
-				item_type: r.item_type, difficulty: r.difficulty,
-				stem: r.stem,
-				choices: r.choices ? JSON.parse(r.choices) : null,
-				answer: r.answer ? JSON.parse(r.answer) : null,
-				solution: r.solution,
-				tags: r.tags ? String(r.tags).split("|") : [],
-				source: r.source, status: r.status
-				}));
+				const data = (results as any[]).map(r => {
+					const base: any = {
+						id: r.id, subject: r.subject, grade: r.grade, unit: r.unit,
+						kcs: r.kcs ? String(r.kcs).split("|") : [],
+						item_type: r.item_type, difficulty: r.difficulty,
+						stem: r.stem,
+						choices: r.choices ? JSON.parse(r.choices) : null,
+						answer: r.answer ? JSON.parse(r.answer) : null,
+						solution: r.solution,
+						tags: r.tags ? String(r.tags).split("|") : [],
+						source: r.source, status: r.status
+					};
+					if (includeAns && authed) base.answer = r.answer ? JSON.parse(r.answer) : null;
+					return base;
+				});
 				return j({ page, count: data.length, items: data }, 200, origin);
 			} catch (e: any) {
 				return j({ error: "items_query_failed", detail: String(e?.message || e) }, 500, origin);
@@ -245,22 +253,53 @@ export default {
 		if (url.pathname.startsWith("/api/items/") && req.method === "GET") {
 			try {
 				const id = url.pathname.split("/").pop()!;
+				const includeAns = url.searchParams.get("include_answer") === "1";
+				const authed  = bearerOk(req, env);
 				const { results } = await env.DB.prepare(`SELECT * FROM items WHERE id=?`).bind(id).all();
 				if (!results || (results as any[]).length === 0) return j({ error: "not_found" }, 404, origin);
 				const r: any = (results as any[])[0];
-				return j({
+				const base: any = {
 					id: r.id, subject: r.subject, grade: r.grade, unit: r.unit,
 					kcs: r.kcs ? String(r.kcs).split("|") : [],
 					item_type: r.item_type, difficulty: r.difficulty,
 					stem: r.stem,
 					choices: r.choices ? JSON.parse(r.choices) : null,
-					answer: r.answer ? JSON.parse(r.answer) : null,
 					solution: r.solution,
 					tags: r.tags ? String(r.tags).split("|") : [],
 					source: r.source, status: r.status
-				}, 200, origin);
+				};
+				if (includeAns && authed) base.answer = r.answer ? JSON.parse(r.answer) : null;
+				return j(base, 200, origin);
 			} catch (e: any) {
 				return j({ error: "item_fetch_failed", detail: String(e?.message || e) }, 500, origin);
+			}
+		}
+
+		// 單題即時判分（不回傳標準答案）
+		if (url.pathname === "/api/grade" && req.method === "POST") {
+			const origin = pickOrigin(env.ALLOW_ORIGIN, req.headers.get("Origin"));
+			if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+
+			try {
+				const body = await req.json().catch(() => ({}));
+				const item_id = String(body.item_id ?? "");
+				const raw_answer = body.raw_answer ?? null;
+				if (!item_id) return j({ error: "missing_item_id" }, 400, origin);
+
+				// 從 DB 取出標準答案
+				const row = await env.DB
+				.prepare(`SELECT answer FROM items WHERE id=? AND status='published'`)
+				.bind(item_id)
+				.first<any>();
+				if (!row?.answer) return j({ error: "answer_not_available" }, 404, origin);
+
+				const correctAns: Answer = JSON.parse(row.answer);
+				const isRight = grade(raw_answer, correctAns) ? 1 : 0;
+
+				// 可選：加上簡訊息，不洩漏正解
+				return j({ item_id, correct: isRight }, 200, origin);
+			} catch (e: any) {
+				return j({ error: "grade_failed", detail: String(e?.message || e) }, 500, origin);
 			}
 		}
 
@@ -415,3 +454,5 @@ ${JSON.stringify(steps)}
 	}
 	}
 } satisfies ExportedHandler<Env>;
+
+
