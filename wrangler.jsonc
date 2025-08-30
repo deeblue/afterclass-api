@@ -10,23 +10,35 @@
 	"compatibility_flags": [
 		"global_fetch_strictly_public"
 	],
+	
+	// 本地開發 port 與 logs
+  	// "dev": { "port": 8787, "local_protocol": "http" },
+
 	"d1_databases": [
     	{ "binding": "DB", "database_name": "afterclass_db", "database_id": "b837c198-e4d5-4ebd-b732-4c81ace75b96" }
   	],
-  	"vars": { "ALLOW_ORIGIN": "https://afterclass.pages.dev, http://localhost:5173" },
+
+  	"vars": { 
+		"ALLOW_ORIGIN": "https://afterclass.pages.dev, http://localhost:5173",
+		"API_VERSION" : "0.2.1"
+	},
+
 	"kv_namespaces": [
 		{
 			"binding": "AFTERCLASS_KV",
 			"id": "19ea342d31de4a4d9b77be10122f4b49"
 		}
   	],
+
 	"assets": {
 		// The path to the directory containing the `index.html` file to be served at `/`
 		"directory": "./public"
 	},
+
 	"observability": {
 		"enabled": true
 	}
+
 	/**
 	 * Smart Placement
 	 * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement

@@ -12,6 +12,10 @@
  */
 // import { ExportedHandler } from "@cloudflare/workers-types";
 
+type WorkerHandler = {
+  fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> | Response;
+};
+
 export interface Env {
   DB: D1Database;
   AFTERCLASS_KV?: KVNamespace; //
@@ -303,6 +307,141 @@ export default {
 			}
 		}
 
+		
+		/* ---------- 建立題目（管理端）POST /api/ingest/items ---------- */
+		if (url.pathname === "/api/ingest/vision" && req.method === "POST") {
+			if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+
+			try {
+				const body = await req.json().catch(() => ({}));
+				const dataUrl: string = String(body.image_data_url || ""); // e.g. "data:image/png;base64,...."
+				const subject: string = String(body.subject || "math");
+				const grade: string = String(body.grade || "g7");
+				const unit: string = String(body.unit || "unsorted");
+
+				if (!env.OPENAI_API_KEY) return j({ error: "no_openai_key" }, 500, origin);
+				if (!dataUrl.startsWith("data:image")) return j({ error: "bad_image" }, 400, origin);
+
+				const sys = `
+你是國中數學題目資料工程師。請把圖片中的多題轉成 JSON 格式：
+{
+"items":[
+	{
+	"item_type": "single|multiple|numeric|text|cloze|ordering|matching|tablefill",
+	"stem": "題幹文字",
+	"choices": ["A. ...","B. ...", ...] 或 {left:[], right:[]}（對應題）或 二維陣列（tablefill）或 null,
+	"answer": 依題型結構化（例如 {kind:"single", index:1} 或 {kind:"numeric", value:"3/4"} ...）,
+	"solution": "（可選）解析",
+	"kcs": ["知識點", "..."]
+	}
+]
+}
+請只輸出 JSON（不要多餘文字）。若不確定答案，可將 answer 設為 null。
+				`;
+
+				const payload = {
+					model: "gpt-4o-mini",
+					messages: [
+						{ role: "system", content: sys },
+						{
+							role: "user",
+							content: [
+								{ type: "text", text: "請辨識圖片中所有題目並切分為多題陣列，使用繁體中文。" },
+								{ type: "image_url", image_url: { url: dataUrl } }
+							]
+						}
+					],
+					temperature: 0.1,
+					response_format: { type: "json_object" }
+				};
+
+				const r = await fetch("https://api.openai.com/v1/chat/completions", {
+					method: "POST",
+					headers: {
+						"Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+						"Content-Type": "application/json"
+					},
+					body: JSON.stringify(payload)
+				});
+				const data = await r.json();
+				const content = data?.choices?.[0]?.message?.content ?? "{}";
+
+				let parsed: any = {};
+				try { parsed = JSON.parse(content); } catch {
+					return j({ error: "parse_failed", raw: content }, 502, origin);
+				}
+				// 補上預設 subject/grade/unit，交由前端可編修
+				const items = Array.isArray(parsed.items) ? parsed.items : [];
+				const normalized = items.map((it: any) => ({
+					id: crypto.randomUUID(),
+					subject, grade, unit,
+					item_type: it.item_type || "text",
+					stem: it.stem || "",
+					choices: it.choices ?? null,
+					answer: it.answer ?? null,
+					solution: it.solution ?? "",
+					difficulty: Number(it.difficulty ?? 3),
+					kcs: Array.isArray(it.kcs) ? it.kcs : [],
+					tags: Array.isArray(it.tags) ? it.tags : [],
+					source: "ingest:vision",
+					status: "draft"
+				}));
+
+				return j({ count: normalized.length, items: normalized }, 200, origin);
+			} catch (e: any) {
+				return j({ error: "ingest_failed", detail: String(e?.message || e) }, 500, origin);
+			}
+		}
+
+		/* ---------- 批量寫入D1 POST /api//items/upsert ---------- */
+		if (url.pathname === "/api/items/upsert" && req.method === "POST") {
+			if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+
+			try {
+				const body = await req.json().catch(() => ({}));
+				const items = Array.isArray(body.items) ? body.items : [];
+				if (!items.length) return j({ upserted: 0 }, 200, origin);
+
+				let upserted = 0;
+				for (const it of items) {
+				const id = String(it.id || crypto.randomUUID());
+				const subject = String(it.subject || "math");
+				const grade = String(it.grade || "g7");
+				const unit = String(it.unit || "unsorted");
+				const item_type = String(it.item_type || "text");
+				const stem = String(it.stem || "");
+				const choicesJson = it.choices != null ? JSON.stringify(it.choices) : null;
+				const answerJson  = it.answer  != null ? JSON.stringify(it.answer)  : null;
+				const solution = String(it.solution || "");
+				const difficulty = Number(it.difficulty ?? 3);
+				const kcs = Array.isArray(it.kcs) ? it.kcs.join("|") : "";
+				const tags = Array.isArray(it.tags) ? it.tags.join("|") : "";
+				const source = String(it.source || "ingest");
+				const status = String(it.status || "published");
+
+				const ins = await env.DB.prepare(`
+					INSERT INTO items
+					(id, subject, grade, unit, item_type, stem, choices, answer, solution, difficulty, kcs, tags, source, status, created_at)
+					VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+					ON CONFLICT(id) DO UPDATE SET
+					subject=excluded.subject, grade=excluded.grade, unit=excluded.unit,
+					item_type=excluded.item_type, stem=excluded.stem,
+					choices=excluded.choices, answer=excluded.answer, solution=excluded.solution,
+					difficulty=excluded.difficulty, kcs=excluded.kcs, tags=excluded.tags,
+					source=excluded.source, status=excluded.status
+				`).bind(
+					id, subject, grade, unit, item_type, stem, choicesJson, answerJson, solution,
+					difficulty, kcs, tags, source, status
+				).run();
+
+				if (ins.success) upserted++;
+				}
+				return j({ upserted }, 200, origin);
+			} catch (e: any) {
+				return j({ error: "upsert_failed", detail: String(e?.message || e) }, 500, origin);
+			}
+		}
+
 		// 批次作答（冪等 + 伺服器端判題 + kc_stats）
 		if (url.pathname === "/api/attempts/bulk" && req.method === "POST") {
 			if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
@@ -445,6 +584,53 @@ ${JSON.stringify(steps)}
 				return j({ error: "process_eval_failed", detail: String(e?.message || e) }, 500, origin);
 			}
 	    }
+
+		// 建立題目（管理端）
+		if (url.pathname === "/api/items" && req.method === "POST") {
+			if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+
+			try {
+				const body = await req.json().catch(() => ({}));
+
+				// 基本欄位（最小可用）
+				const id          = String(body.id || crypto.randomUUID());
+				const subject     = String(body.subject || "math");
+				const grade       = String(body.grade || "g7");
+				const unit        = String(body.unit || "");
+				const item_type   = String(body.item_type || "single");
+				const difficulty  = Number.isFinite(+body.difficulty) ? +body.difficulty : 0.5;
+				const stem        = String(body.stem || "");
+				const solution    = body.solution != null ? String(body.solution) : "";
+				const status      = String(body.status || "published");
+
+				// 陣列 / JSON 欄位
+				const kcs     = Array.isArray(body.kcs) ? body.kcs.join("|") : (body.kcs ? String(body.kcs) : "");
+				const tags    = Array.isArray(body.tags) ? body.tags.join("|") : (body.tags ? String(body.tags) : "");
+				const source  = body.source ? String(body.source) : "manual";
+
+				// 結構化
+				const choices = body.choices != null ? JSON.stringify(body.choices) : null;
+				const answer  = body.answer  != null ? JSON.stringify(body.answer)  : null;
+
+				if (!stem) return j({ error: "missing_stem" }, 400, origin);
+					if (!["single","multiple","numeric","text","cloze","ordering","matching","tablefill","truefalse"].includes(item_type)) {
+					return j({ error: "bad_item_type" }, 400, origin);
+				}
+
+				await env.DB.prepare(
+				`INSERT INTO items
+				(id, subject, grade, unit, kcs, item_type, difficulty, stem, choices, answer, solution, tags, source, status, created_at)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))`
+				).bind(
+				id, subject, grade, unit, kcs, item_type, difficulty, stem, choices, answer, solution, tags, source, status
+				).run();
+
+				return j({ ok: true, id }, 200, origin);
+			} catch (e:any) {
+				return j({ error: "item_create_failed", detail: String(e?.message || e) }, 500, origin);
+			}
+		}
+
 		// 無匹配
     	return j({ error: "not_found" }, 404, origin);
 	} catch (e:any) {
