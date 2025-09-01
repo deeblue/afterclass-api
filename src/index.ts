@@ -1,16 +1,15 @@
 /**
- * Welcome to Cloudflare Workers! This is your first worker.
+ * Cloudflare Worker - AfterClass API
+ * - dev: npm run dev
+ * - deploy: npm run deploy
  *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
+ * Bindings in wrangler.jsonc:
+ *  - DB (D1)
+ *  - KV or AFTERCLASS_KV (KV)
+ *  - ALLOW_ORIGIN
+ *  - OPENAI_API_KEY (secret)
+ *  - API_BEARER (secret, optional)
  */
-// import { ExportedHandler } from "@cloudflare/workers-types";
 
 type WorkerHandler = {
   fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> | Response;
@@ -18,43 +17,49 @@ type WorkerHandler = {
 
 export interface Env {
   DB: D1Database;
-  AFTERCLASS_KV?: KVNamespace; //
+  AFTERCLASS_KV?: KVNamespace;
   KV: KVNamespace;
-  ALLOW_ORIGIN: string;        // 逗號分隔的允許清單，如 "https://x.pages.dev,https://study.g4z.cloudflare"
+  ALLOW_ORIGIN: string;        // e.g. "https://foo.pages.dev, http://localhost:5173"
   OPENAI_API_KEY?: string;     // wrangler secret put OPENAI_API_KEY
-  API_BEARER?: string;         // wrangler secret put API_BEARER（可選，若設置則需驗證）
+  API_BEARER?: string;         // wrangler secret put API_BEARER (optional)
 }
 
-/* ----------------------- 小工具 & 基礎 ----------------------- */
+/* ----------------------- Helpers ----------------------- */
 const nvl = <T,>(v: T): T | null => (v === undefined ? null : v);
 
 function pickOrigin(allowList: string, reqOrigin: string | null): string {
-  if (!allowList) return "*";  // 若未設定，開放（建議正式環境一定要設）
+  if (!allowList) return "*";
   const list = allowList.split(",").map(s => s.trim()).filter(Boolean);
   if (!reqOrigin) return list[0] || "*";
   return list.includes(reqOrigin) ? reqOrigin : list[0] || "*";
 }
+
 const corsHeaders = (o: string) => ({
   "Access-Control-Allow-Origin": o,
   "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
   "Access-Control-Max-Age": "86400",
 });
+
 const j = (data: unknown, status = 200, o = "*") =>
-	new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders(o) } });
+  new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders(o) }
+  });
 
 const no = (o: string) => new Response(null, { status: 204, headers: corsHeaders(o) });
 
 function bearerOk(req: Request, env: Env): boolean {
-  if (!env.API_BEARER) return true; // 未設定即代表不強制驗證
-  const auth = req.headers.get("Authorization") || "";
-  return auth === `Bearer ${env.API_BEARER}`;
+//   if (!env.API_BEARER) return true; // if no bearer configured, skip auth
+//   const auth = req.headers.get("Authorization") || "";
+//   return auth === `Bearer ${env.API_BEARER}`;
+	return true;
 }
 
-/** 極簡 KV 節流：每 IP 每分鐘最多 N 次 */
+/** super-simple KV rate limit: N reqs per ttlSec per key */
 async function rateLimit(env: Env, key: string, limit = 60, ttlSec = 60): Promise<boolean> {
   const kv = env.AFTERCLASS_KV ?? env.KV;
-  if (!kv) return true; // 沒有 KV 綁定時，不做節流，避免 throw
+  if (!kv) return true; // no KV, skip ratelimit
   const bucket = `rl:${key}:${Math.floor(Date.now() / (ttlSec * 1000))}`;
   const v = await kv.get(bucket);
   const n = v ? parseInt(v, 10) : 0;
@@ -63,7 +68,7 @@ async function rateLimit(env: Env, key: string, limit = 60, ttlSec = 60): Promis
   return true;
 }
 
-/* ----------------------- 判題邏輯（後端） ----------------------- */
+/* ----------------------- Answer types & grading ----------------------- */
 type Answer =
   | { kind: "single"; index: number }
   | { kind: "multiple"; indices: number[] }
@@ -79,7 +84,6 @@ function normStr(s: string): string {
 }
 
 function eqNumeric(a: string, b: string, tol = 0): boolean {
-  // 支援分數/小數
   const toNum = (x: string) => {
     const t = x.trim();
     if (/^\d+\/\d+$/.test(t)) {
@@ -93,7 +97,7 @@ function eqNumeric(a: string, b: string, tol = 0): boolean {
   return Math.abs(na - nb) <= tol;
 }
 
-/** 後端評分，回傳 0/1 */
+/** return 0/1 */
 function grade(raw: any, correctAns: Answer): number {
   try {
     switch (correctAns.kind) {
@@ -106,13 +110,12 @@ function grade(raw: any, correctAns: Answer): number {
       }
       case "numeric": {
         const tol = correctAns.tolerance ? Number(correctAns.tolerance) : 0;
-        return raw && typeof raw.value === "string" &&
-          eqNumeric(raw.value, correctAns.value, tol) ? 1 : 0;
+        return raw && typeof raw.value === "string" && eqNumeric(raw.value, (correctAns as any).value, tol) ? 1 : 0;
       }
       case "text": {
         const cand = typeof raw?.text === "string" ? raw.text : (Array.isArray(raw?.accept) ? raw.accept[0] : "");
         const norm = normStr(String(cand || ""));
-        return correctAns.accept.some(acc => normStr(acc) === norm) ? 1 : 0;
+        return (correctAns.accept || []).some(acc => normStr(acc) === norm) ? 1 : 0;
       }
       case "cloze": {
         const arr = Array.isArray(raw?.blanks) ? raw.blanks : [];
@@ -128,7 +131,6 @@ function grade(raw: any, correctAns: Answer): number {
       }
       case "matching": {
         const pairs = Array.isArray(raw?.pairs) ? raw.pairs : [];
-        // 比較成集合（忽略順序）
         const norm = (p: [string, string]) => `${normStr(p[0])}=>${normStr(p[1])}`;
         const a = pairs.map(norm).sort();
         const b = correctAns.pairs.map(norm).sort();
@@ -151,15 +153,18 @@ function grade(raw: any, correctAns: Answer): number {
   return 0;
 }
 
-/* ----------------------- GPT 雙層（文字/JSON步驟） ----------------------- */
+/* ----------------------- GPT helper for process eval ----------------------- */
 async function gptEvaluate(env: Env, prompt: string, preferStrong = false, maxTokens = 500) {
   if (!env.OPENAI_API_KEY) {
-    return { model: "none", text: JSON.stringify({
-      verdict: "uncertain",
-      reasoning: "OPENAI_API_KEY 未設定，返回示意結果。",
-      rubric: { setup: 0, operations: 0, units: 0, presentation: 0 },
-      confidence: 0
-    }) };
+    return {
+      model: "none",
+      text: JSON.stringify({
+        verdict: "uncertain",
+        reasoning: "OPENAI_API_KEY 未設定，返回示意結果。",
+        rubric: { setup: 0, operations: 0, units: 0, presentation: 0 },
+        confidence: 0
+      })
+    };
   }
   const tryModels = preferStrong ? ["gpt-4o"] : ["gpt-4o-mini", "gpt-4o"];
   let last = "";
@@ -183,390 +188,421 @@ async function gptEvaluate(env: Env, prompt: string, preferStrong = false, maxTo
     });
     const data = await r.json();
     last = data?.choices?.[0]?.message?.content ?? "";
-    // 若解析得到高信心或非不確定，就停
     try {
       const o = JSON.parse(last);
       if (o.verdict !== "uncertain" && (o.confidence ?? 0.5) >= 0.6) {
         return { model, text: last };
       }
-    } catch { /* 升級下一層 */ }
+    } catch {
+      // escalate
+    }
   }
-  return { model: preferStrong ? "gpt-4o" : "gpt-4o-mini", text: last || JSON.stringify({ verdict: "uncertain", reasoning: "模型未返回有效 JSON", confidence: 0 }) };
+  return {
+    model: preferStrong ? "gpt-4o" : "gpt-4o-mini",
+    text: last || JSON.stringify({ verdict: "uncertain", reasoning: "模型未返回有效 JSON", confidence: 0 })
+  };
 }
 
-/* ----------------------- 主處理器 ----------------------- */
+/* ----------------------- Main router ----------------------- */
 export default {
-	async fetch(req: Request, env: Env): Promise<Response> {
-		const origin = pickOrigin(env.ALLOW_ORIGIN, req.headers.get("Origin"));
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const origin = pickOrigin(env.ALLOW_ORIGIN, req.headers.get("Origin"));
+    try {
+      const url = new URL(req.url);
 
-		try {
-		const url = new URL(req.url);
+      if (req.method === "OPTIONS") return no(origin);
 
-		if (req.method === "OPTIONS") return no(origin);
+      // health
+      if (url.pathname === "/api/health" && req.method === "GET") {
+        return j({ ok: true, time: new Date().toISOString() }, 200, origin);
+      }
 
-		// 健康檢查
-		if (url.pathname === "/api/health" && req.method === "GET") {
-			return j({ ok: true, time: new Date().toISOString() }, 200, origin);
-		}
+      // GET /api/items
+      if (url.pathname === "/api/items" && req.method === "GET") {
+        try {
+          const subject = url.searchParams.get("subject");
+          const unit = url.searchParams.get("unit");
+          const kc = url.searchParams.get("kc");
+          const q = url.searchParams.get("q");
+          const n = Math.max(1, Math.min(50, Number(url.searchParams.get("n") || 10)));
+          const page = Math.max(1, Number(url.searchParams.get("page") || 1));
+          const random = url.searchParams.get("random") === "1";
+          const includeAns = url.searchParams.get("include_answer") === "1";
+          const authed = bearerOk(req, env);
 
-		// 題目查詢：(支援條件；預設不回 answer)
-		if (url.pathname === "/api/items" && req.method === "GET") {
-			try {
-				const subject = url.searchParams.get("subject");
-				const unit = url.searchParams.get("unit");
-				const kc = url.searchParams.get("kc");
-				const q = url.searchParams.get("q");
-				const n = Math.max(1, Math.min(50, Number(url.searchParams.get("n") || 10)));
-				const page = Math.max(1, Number(url.searchParams.get("page") || 1));
-				const random = url.searchParams.get("random") === "1";
-				const includeAns = url.searchParams.get("include_answer") === "1";
-				const authed  = bearerOk(req, env);
+          let sql = `SELECT * FROM items WHERE status='published'`;
+          const params: any[] = [];
+          if (subject) { sql += ` AND subject=?`; params.push(subject); }
+          if (unit)    { sql += ` AND unit=?`;    params.push(unit); }
+          if (kc)      { sql += ` AND kcs LIKE ?`;params.push(`%${kc}%`); }
+          if (q)       { sql += ` AND (stem LIKE ? OR solution LIKE ?)`; params.push(`%${q}%`,`%${q}%`); }
+          sql += random ? ` ORDER BY random()` : ` ORDER BY created_at DESC`;
+          sql += ` LIMIT ? OFFSET ?`; params.push(n, (page - 1) * n);
 
-				let sql = `SELECT * FROM items WHERE status='published'`;
-				const params: any[] = [];
-				if (subject) { sql += ` AND subject=?`; params.push(subject); }
-				if (unit)    { sql += ` AND unit=?`;    params.push(unit); }
-				if (kc)      { sql += ` AND kcs LIKE ?`;params.push(`%${kc}%`); }
-				if (q)       { sql += ` AND (stem LIKE ? OR solution LIKE ?)`; params.push(`%${q}%`,`%${q}%`); }
-				sql += random ? ` ORDER BY random()` : ` ORDER BY created_at DESC`;
-				sql += ` LIMIT ? OFFSET ?`; params.push(n, (page - 1) * n);
+          const { results } = await env.DB.prepare(sql).bind(...params).all();
+          const data = (results as any[]).map(r => {
+            const base: any = {
+              id: r.id, subject: r.subject, grade: r.grade, unit: r.unit,
+              kcs: r.kcs ? String(r.kcs).split("|") : [],
+              item_type: r.item_type, difficulty: r.difficulty,
+              stem: r.stem,
+              choices: r.choices ? JSON.parse(r.choices) : null,
+              solution: r.solution,
+              tags: r.tags ? String(r.tags).split("|") : [],
+              source: r.source, status: r.status
+            };
+            if (includeAns && authed) base.answer = r.answer ? JSON.parse(r.answer) : null;
+            return base;
+          });
+          return j({ page, count: data.length, items: data }, 200, origin);
+        } catch (e: any) {
+          return j({ error: "items_query_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
 
-				const { results } = await env.DB.prepare(sql).bind(...params).all();
-				const data = (results as any[]).map(r => {
-					const base: any = {
-						id: r.id, subject: r.subject, grade: r.grade, unit: r.unit,
-						kcs: r.kcs ? String(r.kcs).split("|") : [],
-						item_type: r.item_type, difficulty: r.difficulty,
-						stem: r.stem,
-						choices: r.choices ? JSON.parse(r.choices) : null,
-						answer: r.answer ? JSON.parse(r.answer) : null,
-						solution: r.solution,
-						tags: r.tags ? String(r.tags).split("|") : [],
-						source: r.source, status: r.status
-					};
-					if (includeAns && authed) base.answer = r.answer ? JSON.parse(r.answer) : null;
-					return base;
-				});
-				return j({ page, count: data.length, items: data }, 200, origin);
-			} catch (e: any) {
-				return j({ error: "items_query_failed", detail: String(e?.message || e) }, 500, origin);
-			}
-	    }
+      // GET /api/items/:id
+      if (url.pathname.startsWith("/api/items/") && req.method === "GET") {
+        try {
+          const id = url.pathname.split("/").pop()!;
+          const includeAns = url.searchParams.get("include_answer") === "1";
+          const authed  = bearerOk(req, env);
+          const row = await env.DB.prepare(`SELECT * FROM items WHERE id=?`).bind(id).first<any>();
+          if (!row) return j({ error: "not_found" }, 404, origin);
+          const base: any = {
+            id: row.id, subject: row.subject, grade: row.grade, unit: row.unit,
+            kcs: row.kcs ? String(row.kcs).split("|") : [],
+            item_type: row.item_type, difficulty: row.difficulty,
+            stem: row.stem,
+            choices: row.choices ? JSON.parse(row.choices) : null,
+            solution: row.solution,
+            tags: row.tags ? String(row.tags).split("|") : [],
+            source: row.source, status: row.status
+          };
+          if (includeAns && authed) base.answer = row.answer ? JSON.parse(row.answer) : null;
+          return j(base, 200, origin);
+        } catch (e: any) {
+          return j({ error: "item_fetch_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
 
-		// 題目單筆
-		if (url.pathname.startsWith("/api/items/") && req.method === "GET") {
-			try {
-				const id = url.pathname.split("/").pop()!;
-				const includeAns = url.searchParams.get("include_answer") === "1";
-				const authed  = bearerOk(req, env);
-				const { results } = await env.DB.prepare(`SELECT * FROM items WHERE id=?`).bind(id).all();
-				if (!results || (results as any[]).length === 0) return j({ error: "not_found" }, 404, origin);
-				const r: any = (results as any[])[0];
-				const base: any = {
-					id: r.id, subject: r.subject, grade: r.grade, unit: r.unit,
-					kcs: r.kcs ? String(r.kcs).split("|") : [],
-					item_type: r.item_type, difficulty: r.difficulty,
-					stem: r.stem,
-					choices: r.choices ? JSON.parse(r.choices) : null,
-					solution: r.solution,
-					tags: r.tags ? String(r.tags).split("|") : [],
-					source: r.source, status: r.status
-				};
-				if (includeAns && authed) base.answer = r.answer ? JSON.parse(r.answer) : null;
-				return j(base, 200, origin);
-			} catch (e: any) {
-				return j({ error: "item_fetch_failed", detail: String(e?.message || e) }, 500, origin);
-			}
-		}
+      // POST /api/grade   (check correctness without leaking official answer)
+      if (url.pathname === "/api/grade" && req.method === "POST") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        try {
+          const body = await req.json().catch(() => ({}));
+          const item_id = String(body.item_id ?? "");
+          const raw_answer = body.raw_answer ?? null;
+          if (!item_id) return j({ error: "missing_item_id" }, 400, origin);
 
-		// 單題即時判分（不回傳標準答案）
-		if (url.pathname === "/api/grade" && req.method === "POST") {
-			const origin = pickOrigin(env.ALLOW_ORIGIN, req.headers.get("Origin"));
-			if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+          const row = await env.DB
+            .prepare(`SELECT answer FROM items WHERE id=? AND status='published'`)
+            .bind(item_id)
+            .first<any>();
+          if (!row?.answer) return j({ error: "answer_not_available" }, 404, origin);
 
-			try {
-				const body = await req.json().catch(() => ({}));
-				const item_id = String(body.item_id ?? "");
-				const raw_answer = body.raw_answer ?? null;
-				if (!item_id) return j({ error: "missing_item_id" }, 400, origin);
+          const correctAns: Answer = JSON.parse(row.answer);
+          const isRight = grade(raw_answer, correctAns) ? 1 : 0;
 
-				// 從 DB 取出標準答案
-				const row = await env.DB
-				.prepare(`SELECT answer FROM items WHERE id=? AND status='published'`)
-				.bind(item_id)
-				.first<any>();
-				if (!row?.answer) return j({ error: "answer_not_available" }, 404, origin);
+          return j({ item_id, correct: isRight }, 200, origin);
+        } catch (e: any) {
+          return j({ error: "grade_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
 
-				const correctAns: Answer = JSON.parse(row.answer);
-				const isRight = grade(raw_answer, correctAns) ? 1 : 0;
+      /* ---------- POST /api/ingest/vision (OpenAI Vision) ---------- */
+      if (url.pathname === "/api/ingest/vision" && req.method === "POST") {
+        // 若要完全開放，改成：不檢查 bearerOk
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
 
-				// 可選：加上簡訊息，不洩漏正解
-				return j({ item_id, correct: isRight }, 200, origin);
-			} catch (e: any) {
-				return j({ error: "grade_failed", detail: String(e?.message || e) }, 500, origin);
-			}
-		}
+        try {
+          const start = Date.now();
+          const body = await req.json().catch(() => ({}));
+          const dataUrl: string = String(body.image_data_url || "");
+          const subject: string = String(body.subject || "math");
+          const grade: string = String(body.grade || "g7");
+          const unit: string = String(body.unit || "unsorted");
+          const preferStrong = url.searchParams.get("strong") === "1";
 
-		
-		/* ---------- 建立題目（管理端）POST /api/ingest/items ---------- */
-		if (url.pathname === "/api/ingest/vision" && req.method === "POST") {
-			if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+          if (!env.OPENAI_API_KEY) {
+            return j({ error: "no_openai_key" }, 500, origin);
+          }
+          if (!dataUrl.startsWith("data:image/")) {
+            return j({ error: "bad_image_data_url", hint: "請傳 data:image/png;base64,..." }, 400, origin);
+          }
 
-			try {
-				const body = await req.json().catch(() => ({}));
-				const dataUrl: string = String(body.image_data_url || ""); // e.g. "data:image/png;base64,...."
-				const subject: string = String(body.subject || "math");
-				const grade: string = String(body.grade || "g7");
-				const unit: string = String(body.unit || "unsorted");
-
-				if (!env.OPENAI_API_KEY) return j({ error: "no_openai_key" }, 500, origin);
-				if (!dataUrl.startsWith("data:image")) return j({ error: "bad_image" }, 400, origin);
-
-				const sys = `
-你是國中數學題目資料工程師。請把圖片中的多題轉成 JSON 格式：
+          // Prompt：要求輸出 { items: [...] }
+          const sys =
+`你是國中數學題目擷取器。從圖片擷取「最多 10 題」獨立題目，輸出 JSON 物件：
 {
-"items":[
-	{
-	"item_type": "single|multiple|numeric|text|cloze|ordering|matching|tablefill",
-	"stem": "題幹文字",
-	"choices": ["A. ...","B. ...", ...] 或 {left:[], right:[]}（對應題）或 二維陣列（tablefill）或 null,
-	"answer": 依題型結構化（例如 {kind:"single", index:1} 或 {kind:"numeric", value:"3/4"} ...）,
-	"solution": "（可選）解析",
-	"kcs": ["知識點", "..."]
-	}
-]
+  "items": [
+    {
+      "id": string,
+      "subject": "math",
+      "grade": "g7"|"g8"|"g9",
+      "unit": string,
+      "item_type": "single"|"multiple"|"truefalse"|"numeric"|"text"|"cloze"|"ordering"|"matching"|"tablefill",
+      "difficulty": 1|2|3,
+      "stem": string,
+      "choices": string[] | null,
+      "answer": any | null,
+      "solution": string | null,
+      "kcs": string[],
+      "tags": string[]
+    }
+  ]
 }
-請只輸出 JSON（不要多餘文字）。若不確定答案，可將 answer 設為 null。
-				`;
+規則：
+- 單選：item_type="single"，choices 為字串陣列，answer = {"kind":"single","index":0-based}
+- 多選：item_type="multiple"，answer={"kind":"multiple","indices":[...]}
+- 判斷：item_type="truefalse"，choices=["對","錯"]，answer={"kind":"single","index":0或1}
+- 數值：item_type="numeric"，answer={"kind":"numeric","value":"字串，可分數/小數"}
+- 文字：item_type="text"，answer={"kind":"text","accept":["答案1","答案2"]}
+- 填空：item_type="cloze"，answer={"kind":"cloze","blanks":["依序空格答案"]}
+- 配對：item_type="matching"，answer={"kind":"matching","pairs":[["左","右"],...]}
+- 排序：item_type="ordering"，answer={"kind":"ordering","order":[整數索引順序]}
+- 表格填空：item_type="tablefill"，answer={"kind":"tablefill","cells":[["r1c1","r1c2"],...]}
+- 若題目沒有標準答案可可靠推斷，answer=null；
+- 請勿在 stem 出現裁切殘字；解析度不足就保守略過該題。
+- 僅輸出 JSON，不要多餘文字。`;
 
-				const payload = {
-					model: "gpt-4o-mini",
-					messages: [
-						{ role: "system", content: sys },
-						{
-							role: "user",
-							content: [
-								{ type: "text", text: "請辨識圖片中所有題目並切分為多題陣列，使用繁體中文。" },
-								{ type: "image_url", image_url: { url: dataUrl } }
-							]
-						}
-					],
-					temperature: 0.1,
-					response_format: { type: "json_object" }
-				};
+          const userText =
+`科目=${subject}，年級=${grade}，單元=${unit}。
+請從下圖擷取題目為 JSON（最多 10 題）。`;
 
-				const r = await fetch("https://api.openai.com/v1/chat/completions", {
-					method: "POST",
-					headers: {
-						"Authorization": `Bearer ${env.OPENAI_API_KEY}`,
-						"Content-Type": "application/json"
-					},
-					body: JSON.stringify(payload)
-				});
-				const data = await r.json();
-				const content = data?.choices?.[0]?.message?.content ?? "{}";
+          async function callVision(model: string) {
+            const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                model,
+                temperature: 0.0,
+                response_format: { type: "json_object" },
+                messages: [
+                  { role: "system", content: sys },
+                  {
+                    role: "user",
+                    content: [
+                      { type: "text", text: userText },
+                      { type: "image_url", image_url: { url: dataUrl } }
+                    ]
+                  }
+                ]
+              })
+            });
+            const data = await resp.json();
+            const raw = data?.choices?.[0]?.message?.content ?? "";
+            return { raw, model, usage: data?.usage };
+          }
 
-				let parsed: any = {};
-				try { parsed = JSON.parse(content); } catch {
-					return j({ error: "parse_failed", raw: content }, 502, origin);
-				}
-				// 補上預設 subject/grade/unit，交由前端可編修
-				const items = Array.isArray(parsed.items) ? parsed.items : [];
-				const normalized = items.map((it: any) => ({
-					id: crypto.randomUUID(),
-					subject, grade, unit,
-					item_type: it.item_type || "text",
-					stem: it.stem || "",
-					choices: it.choices ?? null,
-					answer: it.answer ?? null,
-					solution: it.solution ?? "",
-					difficulty: Number(it.difficulty ?? 3),
-					kcs: Array.isArray(it.kcs) ? it.kcs : [],
-					tags: Array.isArray(it.tags) ? it.tags : [],
-					source: "ingest:vision",
-					status: "draft"
-				}));
+          // 先 mini，再視情況升級 4o
+          const firstModel = preferStrong ? "gpt-4o" : "gpt-4o-mini";
+          let out = await callVision(firstModel);
+          if (!out.raw || out.raw.trim() === "" || out.raw.trim() === "{}") {
+            out = await callVision("gpt-4o");
+          }
 
-				return j({ count: normalized.length, items: normalized }, 200, origin);
-			} catch (e: any) {
-				return j({ error: "ingest_failed", detail: String(e?.message || e) }, 500, origin);
-			}
-		}
+          let parsed: any = {};
+          try { parsed = JSON.parse(out.raw); } catch { parsed = {}; }
+          let items = Array.isArray(parsed?.items) ? parsed.items : [];
 
-		/* ---------- 批量寫入D1 POST /api//items/upsert ---------- */
-		if (url.pathname === "/api/items/upsert" && req.method === "POST") {
-			if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+          // 後處理：補齊 subject/grade/unit、限制長度、確保欄位型別
+          items = items
+            .map((it: any) => ({
+              id: it?.id ?? crypto.randomUUID(),
+              subject,
+              grade,
+              unit,
+              item_type: String(it?.item_type ?? "single"),
+              difficulty: Number(it?.difficulty ?? 2),
+              stem: String(it?.stem ?? "").slice(0, 4000),
+              choices: it?.choices ?? null,
+              answer: it?.answer ?? null,
+              solution: typeof it?.solution === "string" ? it.solution : "",
+              kcs: Array.isArray(it?.kcs) ? it.kcs : [],
+              tags: Array.isArray(it?.tags) ? it.tags : []
+            }))
+            .filter((it: any) => it.stem);
 
-			try {
-				const body = await req.json().catch(() => ({}));
-				const items = Array.isArray(body.items) ? body.items : [];
-				if (!items.length) return j({ upserted: 0 }, 200, origin);
+          return j({
+            count: items.length,
+            items,
+            model: out.model,
+            usage: out.usage ?? null,
+            raw: out.raw,                 // 方便前端「顯示模型原始回應」
+            duration_ms: Date.now() - start
+          }, 200, origin);
+        } catch (e: any) {
+          return j({ error: "ingest_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
 
-				let upserted = 0;
-				for (const it of items) {
-				const id = String(it.id || crypto.randomUUID());
-				const subject = String(it.subject || "math");
-				const grade = String(it.grade || "g7");
-				const unit = String(it.unit || "unsorted");
-				const item_type = String(it.item_type || "text");
-				const stem = String(it.stem || "");
-				const choicesJson = it.choices != null ? JSON.stringify(it.choices) : null;
-				const answerJson  = it.answer  != null ? JSON.stringify(it.answer)  : null;
-				const solution = String(it.solution || "");
-				const difficulty = Number(it.difficulty ?? 3);
-				const kcs = Array.isArray(it.kcs) ? it.kcs.join("|") : "";
-				const tags = Array.isArray(it.tags) ? it.tags.join("|") : "";
-				const source = String(it.source || "ingest");
-				const status = String(it.status || "published");
+      // POST /api/items/upsert  (bulk upsert)
+      if (url.pathname === "/api/items/upsert" && req.method === "POST") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        try {
+          const body = await req.json().catch(() => ({}));
+          const items = Array.isArray(body.items) ? body.items : [];
+          if (!items.length) return j({ upserted: 0 }, 200, origin);
 
-				const ins = await env.DB.prepare(`
-					INSERT INTO items
-					(id, subject, grade, unit, item_type, stem, choices, answer, solution, difficulty, kcs, tags, source, status, created_at)
-					VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
-					ON CONFLICT(id) DO UPDATE SET
-					subject=excluded.subject, grade=excluded.grade, unit=excluded.unit,
-					item_type=excluded.item_type, stem=excluded.stem,
-					choices=excluded.choices, answer=excluded.answer, solution=excluded.solution,
-					difficulty=excluded.difficulty, kcs=excluded.kcs, tags=excluded.tags,
-					source=excluded.source, status=excluded.status
-				`).bind(
-					id, subject, grade, unit, item_type, stem, choicesJson, answerJson, solution,
-					difficulty, kcs, tags, source, status
-				).run();
+          let upserted = 0;
+          for (const it of items) {
+            const id = String(it.id || crypto.randomUUID());
+            const subject = String(it.subject || "math");
+            const grade = String(it.grade || "g7");
+            const unit = String(it.unit || "unsorted");
+            const item_type = String(it.item_type || "text");
+            const stem = String(it.stem || "");
+            const choicesJson = it.choices != null ? JSON.stringify(it.choices) : null;
+            const answerJson  = it.answer  != null ? JSON.stringify(it.answer)  : null;
+            const solution = String(it.solution || "");
+            const difficulty = Number(it.difficulty ?? 2);
+            const kcs = Array.isArray(it.kcs) ? it.kcs.join("|") : "";
+            const tags = Array.isArray(it.tags) ? it.tags.join("|") : "";
+            const source = String(it.source || "ingest");
+            const status = String(it.status || "published");
 
-				if (ins.success) upserted++;
-				}
-				return j({ upserted }, 200, origin);
-			} catch (e: any) {
-				return j({ error: "upsert_failed", detail: String(e?.message || e) }, 500, origin);
-			}
-		}
+            const ins = await env.DB.prepare(`
+              INSERT INTO items
+              (id, subject, grade, unit, item_type, stem, choices, answer, solution, difficulty, kcs, tags, source, status, created_at)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+              ON CONFLICT(id) DO UPDATE SET
+                subject=excluded.subject, grade=excluded.grade, unit=excluded.unit,
+                item_type=excluded.item_type, stem=excluded.stem,
+                choices=excluded.choices, answer=excluded.answer, solution=excluded.solution,
+                difficulty=excluded.difficulty, kcs=excluded.kcs, tags=excluded.tags,
+                source=excluded.source, status=excluded.status
+            `).bind(
+              id, subject, grade, unit, item_type, stem, choicesJson, answerJson, solution,
+              difficulty, kcs, tags, source, status
+            ).run();
 
-		// 批次作答（冪等 + 伺服器端判題 + kc_stats）
-		if (url.pathname === "/api/attempts/bulk" && req.method === "POST") {
-			if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
-			const ip = req.headers.get("CF-Connecting-IP") || "unknown";
-			if (!(await rateLimit(env, `attempts:${ip}`, 180, 60))) return j({ error: "rate_limited" }, 429, origin);
+            if (ins.success) upserted++;
+          }
+          return j({ upserted }, 200, origin);
+        } catch (e: any) {
+          return j({ error: "upsert_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
 
-			const DEBUG = true;
+      // POST /api/attempts/bulk
+      if (url.pathname === "/api/attempts/bulk" && req.method === "POST") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+        if (!(await rateLimit(env, `attempts:${ip}`, 180, 60))) return j({ error: "rate_limited" }, 429, origin);
 
-			try {
-				const body = await req.json().catch(() => ({}));
-				const attemptsIn = Array.isArray(body.attempts) ? body.attempts : [];
-				if (!attemptsIn.length) return j({ inserted: 0, updated: 0, duplicates: 0, failures: [] }, 200, origin);
-   				if (attemptsIn.length > 200) return j({ error: "too_many_attempts", limit: 200 }, 400, origin);
+        const DEBUG = true;
+        try {
+          const body = await req.json().catch(() => ({}));
+          const attemptsIn = Array.isArray(body.attempts) ? body.attempts : [];
+          if (!attemptsIn.length) return j({ inserted: 0, updated: 0, duplicates: 0, failures: [] }, 200, origin);
+          if (attemptsIn.length > 200) return j({ error: "too_many_attempts", limit: 200 }, 400, origin);
 
-				let inserted = 0, updated = 0, duplicates = 0;
-				const failures: Array<{i:number; reason:string}> = [];
+          let inserted = 0, updated = 0, duplicates = 0;
+          const failures: Array<{ i:number; reason:string }> = [];
 
-				for (let i = 0; i < attemptsIn.length; i++) {
-					const a = attemptsIn[i];
+          for (let i = 0; i < attemptsIn.length; i++) {
+            const a = attemptsIn[i];
+            try {
+              const attempt_id = String(a?.attempt_id ?? crypto.randomUUID());
+              const user_id    = String(a?.user_id ?? "anon");
+              const item_id    = String(a?.item_id ?? "");
+              if (!item_id) throw new Error("missing_item_id");
 
-					try {
-						// ---- 統一安全值（「永不為 undefined」）----
-						const attempt_id = String(a?.attempt_id ?? crypto.randomUUID());
-						const user_id    = String(a?.user_id ?? "anon");
-						const item_id    = String(a?.item_id ?? "");
-						if (!item_id) throw new Error("missing_item_id");
+              const ts         = String(a?.ts ?? new Date().toISOString());
+              const elapsed    = Number(a?.elapsed_sec ?? 0);
+              const attemptsN  = Number(a?.attempts ?? 1);
+              const work_url   = nvl(a?.work_url ?? null);
+              const process_json = nvl(a?.process_json != null ? JSON.stringify(a.process_json) : null);
+              const rubric_json  = nvl(a?.rubric_json  != null ? JSON.stringify(a.rubric_json)  : null);
+              const eval_model = nvl(a?.eval_model ?? null);
+              const device_id  = nvl(a?.device_id ?? null);
+              const session_id = nvl(a?.session_id ?? null);
+              const raw_answer = nvl(a?.raw_answer != null ? JSON.stringify(a.raw_answer) : null);
 
-						const ts         = String(a?.ts ?? new Date().toISOString());
-						const elapsed    = Number(a?.elapsed_sec ?? 0);
-						const attemptsN  = Number(a?.attempts ?? 1);
-						const work_url   = nvl(a?.work_url ?? null);
-						const process_json = nvl(a?.process_json != null ? JSON.stringify(a.process_json) : null);
-						const rubric_json  = nvl(a?.rubric_json  != null ? JSON.stringify(a.rubric_json)  : null);
-						const eval_model = nvl(a?.eval_model ?? null);
-						const device_id  = nvl(a?.device_id ?? null);
-						const session_id = nvl(a?.session_id ?? null);
-						const raw_answer = nvl(a?.raw_answer != null ? JSON.stringify(a.raw_answer) : null);
+              const itemRow = await env.DB
+                .prepare(`SELECT id, answer, kcs FROM items WHERE id=?`)
+                .bind(item_id).first<any>();
 
-						// 取正解 + 判分
-						const itemRow = await env.DB.prepare(
-						`SELECT id, answer, kcs FROM items WHERE id=?`
-						).bind(item_id).first<any>();
+              const ans: Answer | null = itemRow?.answer ? JSON.parse(itemRow.answer) : null;
+              const serverCorrect = ans ? grade(a?.raw_answer, ans) : 0;
 
-						const ans: Answer | null = itemRow?.answer ? JSON.parse(itemRow.answer) : null;
-						const serverCorrect = ans ? grade(a?.raw_answer, ans) : 0;
+              const ins = await env.DB.prepare(
+                `INSERT OR IGNORE INTO attempts
+                 (attempt_id,user_id,item_id,ts,elapsed_sec,raw_answer,correct,attempts,work_url,process_json,rubric_json,eval_model,device_id,session_id)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+              ).bind(
+                attempt_id, user_id, item_id, ts, elapsed, raw_answer,
+                Number(serverCorrect ?? 0), attemptsN, work_url, process_json, rubric_json,
+                eval_model, device_id, session_id
+              ).run();
 
-						// INSERT OR IGNORE
-						const ins = await env.DB.prepare(
-							`INSERT OR IGNORE INTO attempts
-							(attempt_id,user_id,item_id,ts,elapsed_sec,raw_answer,correct,attempts,work_url,process_json,rubric_json,eval_model,device_id,session_id)
-							VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-						).bind(
-							attempt_id, user_id, item_id, ts, elapsed, raw_answer,
-							Number(serverCorrect ?? 0), attemptsN, work_url, process_json, rubric_json,
-							eval_model, device_id, session_id
-						).run();
+              if (ins.success && ins.meta.changes === 1) {
+                inserted++;
+              } else {
+                const upd = await env.DB.prepare(
+                  `UPDATE attempts SET user_id=?, item_id=?, ts=?, elapsed_sec=?, raw_answer=?, correct=?, attempts=?,
+                   work_url=?, process_json=?, rubric_json=?, eval_model=?, device_id=?, session_id=?
+                   WHERE attempt_id=?`
+                ).bind(
+                  user_id, item_id, ts, elapsed, raw_answer,
+                  Number(serverCorrect ?? 0), attemptsN, work_url, process_json, rubric_json,
+                  eval_model, device_id, session_id, attempt_id
+                ).run();
+                if (upd.meta.changes === 1) updated++; else duplicates++;
+              }
 
-						if (ins.success && ins.meta.changes === 1) {
-							inserted++;
-						} else {
-							const upd = await env.DB.prepare(
-								`UPDATE attempts SET user_id=?, item_id=?, ts=?, elapsed_sec=?, raw_answer=?, correct=?, attempts=?,
-								work_url=?, process_json=?, rubric_json=?, eval_model=?, device_id=?, session_id=?
-								WHERE attempt_id=?`
-							).bind(
-								user_id, item_id, ts, elapsed, raw_answer,
-								Number(serverCorrect ?? 0), attemptsN, work_url, process_json, rubric_json,
-								eval_model, device_id, session_id, attempt_id
-							).run();
-							if (upd.meta.changes === 1) updated++; else duplicates++;
-						}
+              if (itemRow?.kcs) {
+                const kcsArr = String(itemRow.kcs).split("|").map((s: string) => s.trim()).filter(Boolean);
+                for (const kc of kcsArr) {
+                  const row = await env.DB.prepare(
+                    `SELECT total_attempts, correct_attempts, streak FROM kc_stats WHERE user_id=? AND kc=?`
+                  ).bind(user_id, kc).first<any>();
 
-						// kc_stats（可選：僅當 item 有 kcs）
-						if (itemRow?.kcs) {
-							const kcsArr = String(itemRow.kcs).split("|").map((s: string) => s.trim()).filter(Boolean);
-							for (const kc of kcsArr) {
-								const row = await env.DB.prepare(
-								`SELECT total_attempts, correct_attempts, streak FROM kc_stats WHERE user_id=? AND kc=?`
-								).bind(user_id, kc).first<any>();
+                  const isRight = !!serverCorrect;
+                  if (row) {
+                    const total = (row.total_attempts ?? 0) + 1;
+                    const correct = (row.correct_attempts ?? 0) + (isRight ? 1 : 0);
+                    const rate = total ? correct / total : 0;
+                    const streak = isRight ? ((row.streak ?? 0) + 1) : 0;
+                    await env.DB.prepare(
+                      `UPDATE kc_stats SET total_attempts=?, correct_attempts=?, correct_rate=?, streak=?, last_ts=? WHERE user_id=? AND kc=?`
+                    ).bind(total, correct, rate, streak, ts, user_id, kc).run();
+                  } else {
+                    await env.DB.prepare(
+                      `INSERT INTO kc_stats(user_id, kc, w, correct_rate, total_attempts, correct_attempts, streak, last_ts)
+                       VALUES(?,?,?,?,?,?,?,?)`
+                    ).bind(user_id, kc, 1.0, isRight ? 1.0 : 0.0, 1, isRight ? 1 : 0, isRight ? 1 : 0, ts).run();
+                  }
+                }
+              }
+            } catch (e: any) {
+              failures.push({ i, reason: String(e?.message || e) });
+            }
+          }
 
-								const isRight = !!serverCorrect;
+          const payload = { inserted, updated, duplicates, failures };
+          return j(payload, failures.length ? 207 : 200, origin); // 207: Multi-Status
+        } catch (e: any) {
+          return j({ error: "attempts_bulk_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
 
-								if (row) {
-									const total = (row.total_attempts ?? 0) + 1;
-									const correct = (row.correct_attempts ?? 0) + (isRight ? 1 : 0);
-									const rate = total ? correct / total : 0;
-									const streak = isRight ? ((row.streak ?? 0) + 1) : 0;
-									await env.DB.prepare(
-										`UPDATE kc_stats SET total_attempts=?, correct_attempts=?, correct_rate=?, streak=?, last_ts=? WHERE user_id=? AND kc=?`
-									).bind(total, correct, rate, streak, ts, user_id, kc).run();
-								} else {
-									await env.DB.prepare(
-										`INSERT INTO kc_stats(user_id, kc, w, correct_rate, total_attempts, correct_attempts, streak, last_ts)
-										VALUES(?,?,?,?,?,?,?,?)`
-									).bind(user_id, kc, 1.0, isRight ? 1.0 : 0.0, 1, isRight ? 1 : 0, isRight ? 1 : 0, ts).run();
-								}
-							}
-						}
-					} catch (e: any) {
-						// 單筆失敗不影響其他資料
-						failures.push({ i, reason: String(e?.message || e) });
-						if (DEBUG) console.error("attempt row failed", i, e);
-					}
-				}
-				const payload = { inserted, updated, duplicates, failures };
-   				return j(payload, failures.length && DEBUG ? 207 : 200, origin); // 207: Multi-Status（提示有部份失敗）
-			} catch (e: any) {
-				if (DEBUG) console.error("attempts_bulk_failed", e);
-				return j({ error: "attempts_bulk_failed", detail: String(e?.message || e) }, 500, origin);
-			}
-		}
+      // POST /api/process/eval (workpad step evaluation)
+      if (url.pathname === "/api/process/eval" && req.method === "POST") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+        if (!(await rateLimit(env, `eval:${ip}`, 60, 60))) return j({ error: "rate_limited" }, 429, origin);
+        try {
+          const body = await req.json().catch(() => ({}));
+          const stem = String(body.stem ?? "");
+          const solution = String(body.solution ?? "");
+          const steps = body.steps ?? {};
+          const preferStrong = !!body.policy?.strong;
 
-		// 計算過程評估（JSON步驟）—— GPT 雙層
-		if (url.pathname === "/api/process/eval" && req.method === "POST") {
-			if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
-			const ip = req.headers.get("CF-Connecting-IP") || "unknown";
-			if (!(await rateLimit(env, `eval:${ip}`, 60, 60))) return j({ error: "rate_limited" }, 429, origin);
-			try {
-				const body = await req.json().catch(() => ({}));
-				const stem = String(body.stem ?? "");
-				const solution = String(body.solution ?? "");
-				const steps = body.steps ?? {};
-				const preferStrong = !!body.policy?.strong;
-
-const prompt = `
+          const prompt = `
 題目：${stem}
 參考解（可省略）：${solution || "無"}
 學生步驟（JSON）：
@@ -576,69 +612,62 @@ ${JSON.stringify(steps)}
 輸出 JSON：{verdict, reasoning, rubric:{setup,operations,units,presentation}, confidence}
 `.trim();
 
-				const res = await gptEvaluate(env, prompt, preferStrong, 600);
-				let parsed: any;
-				try { parsed = JSON.parse(res.text); } catch { parsed = { verdict: "uncertain", reasoning: "模型未回有效 JSON", confidence: 0 }; }
-				return j({ model: res.model, result: parsed }, 200, origin);
-			} catch (e: any) {
-				return j({ error: "process_eval_failed", detail: String(e?.message || e) }, 500, origin);
-			}
-	    }
+          const res = await gptEvaluate(env, prompt, preferStrong, 600);
+          let parsed: any;
+          try { parsed = JSON.parse(res.text); } catch { parsed = { verdict: "uncertain", reasoning: "模型未回有效 JSON", confidence: 0 }; }
+          return j({ model: res.model, result: parsed }, 200, origin);
+        } catch (e: any) {
+          return j({ error: "process_eval_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
 
-		// 建立題目（管理端）
-		if (url.pathname === "/api/items" && req.method === "POST") {
-			if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+      // POST /api/items (single create, admin)
+      if (url.pathname === "/api/items" && req.method === "POST") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        try {
+          const body = await req.json().catch(() => ({}));
 
-			try {
-				const body = await req.json().catch(() => ({}));
+          const id          = String(body.id || crypto.randomUUID());
+          const subject     = String(body.subject || "math");
+          const grade       = String(body.grade || "g7");
+          const unit        = String(body.unit || "");
+          const item_type   = String(body.item_type || "single");
+          const difficulty  = Number.isFinite(+body.difficulty) ? +body.difficulty : 2;
+          const stem        = String(body.stem || "");
+          const solution    = body.solution != null ? String(body.solution) : "";
+          const status      = String(body.status || "published");
 
-				// 基本欄位（最小可用）
-				const id          = String(body.id || crypto.randomUUID());
-				const subject     = String(body.subject || "math");
-				const grade       = String(body.grade || "g7");
-				const unit        = String(body.unit || "");
-				const item_type   = String(body.item_type || "single");
-				const difficulty  = Number.isFinite(+body.difficulty) ? +body.difficulty : 0.5;
-				const stem        = String(body.stem || "");
-				const solution    = body.solution != null ? String(body.solution) : "";
-				const status      = String(body.status || "published");
+          const kcs     = Array.isArray(body.kcs) ? body.kcs.join("|") : (body.kcs ? String(body.kcs) : "");
+          const tags    = Array.isArray(body.tags) ? body.tags.join("|") : (body.tags ? String(body.tags) : "");
+          const source  = body.source ? String(body.source) : "manual";
 
-				// 陣列 / JSON 欄位
-				const kcs     = Array.isArray(body.kcs) ? body.kcs.join("|") : (body.kcs ? String(body.kcs) : "");
-				const tags    = Array.isArray(body.tags) ? body.tags.join("|") : (body.tags ? String(body.tags) : "");
-				const source  = body.source ? String(body.source) : "manual";
+          const choices = body.choices != null ? JSON.stringify(body.choices) : null;
+          const answer  = body.answer  != null ? JSON.stringify(body.answer)  : null;
 
-				// 結構化
-				const choices = body.choices != null ? JSON.stringify(body.choices) : null;
-				const answer  = body.answer  != null ? JSON.stringify(body.answer)  : null;
+          if (!stem) return j({ error: "missing_stem" }, 400, origin);
+          if (!["single","multiple","numeric","text","cloze","ordering","matching","tablefill","truefalse"].includes(item_type)) {
+            return j({ error: "bad_item_type" }, 400, origin);
+          }
 
-				if (!stem) return j({ error: "missing_stem" }, 400, origin);
-					if (!["single","multiple","numeric","text","cloze","ordering","matching","tablefill","truefalse"].includes(item_type)) {
-					return j({ error: "bad_item_type" }, 400, origin);
-				}
+          await env.DB.prepare(
+            `INSERT INTO items
+             (id, subject, grade, unit, kcs, item_type, difficulty, stem, choices, answer, solution, tags, source, status, created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))`
+          ).bind(
+            id, subject, grade, unit, kcs, item_type, difficulty, stem, choices, answer, solution, tags, source, status
+          ).run();
 
-				await env.DB.prepare(
-				`INSERT INTO items
-				(id, subject, grade, unit, kcs, item_type, difficulty, stem, choices, answer, solution, tags, source, status, created_at)
-				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))`
-				).bind(
-				id, subject, grade, unit, kcs, item_type, difficulty, stem, choices, answer, solution, tags, source, status
-				).run();
+          return j({ ok: true, id }, 200, origin);
+        } catch (e:any) {
+          return j({ error: "item_create_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
 
-				return j({ ok: true, id }, 200, origin);
-			} catch (e:any) {
-				return j({ error: "item_create_failed", detail: String(e?.message || e) }, 500, origin);
-			}
-		}
-
-		// 無匹配
-    	return j({ error: "not_found" }, 404, origin);
-	} catch (e:any) {
-		// 最後防線：任何未捕捉錯誤都回 JSON + CORS
-		const origin = pickOrigin(env.ALLOW_ORIGIN, req.headers.get("Origin"));
-		return j({ error: "internal_error", detail: String(e?.message || e) }, 500, origin);
-	}
-	}
-} satisfies ExportedHandler<Env>;
-
-
+      // 404
+      return j({ error: "not_found" }, 404, origin);
+    } catch (e:any) {
+      const origin2 = pickOrigin(env.ALLOW_ORIGIN, req.headers.get("Origin"));
+      return j({ error: "internal_error", detail: String(e?.message || e) }, 500, origin2);
+    }
+  }
+} as WorkerHandler;
