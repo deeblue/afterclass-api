@@ -203,6 +203,7 @@ async function gptEvaluate(env: Env, prompt: string, preferStrong = false, maxTo
   };
 }
 
+
 /* ----------------------- Main router ----------------------- */
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -369,40 +370,85 @@ export default {
 `科目=${subject}，年級=${grade}，單元=${unit}。
 請從下圖擷取題目為 JSON（最多 10 題）。`;
 
-          async function callVision(model: string) {
-            const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
-                "Content-Type": "application/json"
-              },
-              body: JSON.stringify({
-                model,
-                temperature: 0.0,
-                response_format: { type: "json_object" },
-                messages: [
-                  { role: "system", content: sys },
-                  {
-                    role: "user",
-                    content: [
-                      { type: "text", text: userText },
-                      { type: "image_url", image_url: { url: dataUrl } }
-                    ]
-                  }
-                ]
-              })
-            });
-            const data = await resp.json();
-            const raw = data?.choices?.[0]?.message?.content ?? "";
-            return { raw, model, usage: data?.usage };
-          }
+        //   async function callVision(model: string) {
+        //     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+        //       method: "POST",
+        //       headers: {
+        //         "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+        //         "Content-Type": "application/json"
+        //       },
+        //       body: JSON.stringify({
+        //         model,
+        //         temperature: 0.0,
+        //         response_format: { type: "json_object" },
+        //         messages: [
+        //           { role: "system", content: sys },
+        //           {
+        //             role: "user",
+        //             content: [
+        //               { type: "text", text: userText },
+        //               { type: "image_url", image_url: { url: dataUrl } }
+        //             ]
+        //           }
+        //         ]
+        //       })
+        //     });
+        //     const data = await resp.json();
+        //     const raw = data?.choices?.[0]?.message?.content ?? "";
+        //     return { raw, model, usage: data?.usage };
+        //   }
+
+		async function callVision(env: Env, model: string, dataUrl: string, userText: string, sys: string) {
+		const r = await fetch("https://api.openai.com/v1/chat/completions", {
+			method: "POST",
+			headers: {
+			"Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+			"Content-Type": "application/json"
+			},
+			body: JSON.stringify({
+			model,
+			temperature: 0.0,
+			response_format: { type: "json_object" },
+			messages: [
+				{ role: "system", content: sys },
+				{
+				role: "user",
+				content: [
+					{ type: "text", text: userText },
+					{ type: "image_url", image_url: { url: dataUrl } }
+				]
+				}
+			]
+			})
+		});
+
+		let payload: any = null;
+		try { payload = await r.json(); } catch { payload = null; }
+
+		const ok = r.ok && payload?.choices?.[0]?.message?.content;
+		return {
+			ok,
+			status: r.status,
+			payload,
+			raw: ok ? payload.choices[0].message.content : "",
+			usage: payload?.usage || null,
+			error: !ok ? (payload?.error || { message: "unknown_error" }) : null
+		};
+		}
 
           // 先 mini，再視情況升級 4o
           const firstModel = preferStrong ? "gpt-4o" : "gpt-4o-mini";
-          let out = await callVision(firstModel);
-          if (!out.raw || out.raw.trim() === "" || out.raw.trim() === "{}") {
-            out = await callVision("gpt-4o");
-          }
+        //   let out = await callVision(firstModel);
+        //   if (!out.raw || out.raw.trim() === "" || out.raw.trim() === "{}") {
+        //     out = await callVision("gpt-4o");
+        //   }
+		  let out = await callVision(env, firstModel, dataUrl, userText, sys);
+		  if (!out.ok) {
+			const fallback = await callVision(env, "gpt-4o", dataUrl, userText, sys);
+			// 若 fallback OK 就用 fallback；否則仍用第一次但帶出錯誤
+			if (fallback.ok) out = fallback; else out = { ...out, model: firstModel, fallback_error: fallback.error, fallback_status: fallback.status };
+		  }
+
 
           let parsed: any = {};
           try { parsed = JSON.parse(out.raw); } catch { parsed = {}; }
@@ -432,6 +478,10 @@ export default {
             model: out.model,
             usage: out.usage ?? null,
             raw: out.raw,                 // 方便前端「顯示模型原始回應」
+			oai_status: out.status,
+			oai_error: out.error || null,
+			fallback_status: (out as any).fallback_status || null,
+			fallback_error: (out as any).fallback_error || null,
             duration_ms: Date.now() - start
           }, 200, origin);
         } catch (e: any) {
@@ -487,6 +537,143 @@ export default {
         }
       }
 
+	/* ----------------------- Backup ----------------------- */
+	async function backupToKV(env: Env, scope: "items"|"all" = "items") {
+		const kv = env.AFTERCLASS_KV ?? env.KV;
+		if (!kv) throw new Error("KV not bound");
+
+		const out: any = {
+			schema: "afterclass-backup.v1",
+			scope,
+			created_at: new Date().toISOString(),
+			items: [] as any[],
+		};
+
+		// items
+		{
+			const { results } = await env.DB.prepare(
+			`SELECT id,subject,grade,unit,item_type,stem,choices,answer,solution,difficulty,kcs,tags,source,status,created_at,updated_at
+			FROM items`
+			).all();
+			out.items = (results as any[]).map(r => ({
+			id: r.id,
+			subject: r.subject,
+			grade: r.grade,
+			unit: r.unit,
+			item_type: r.item_type,
+			stem: r.stem,
+			choices: r.choices ? JSON.parse(r.choices) : null,
+			answer:  r.answer  ? JSON.parse(r.answer)  : null,
+			solution: r.solution,
+			difficulty: r.difficulty,
+			kcs: r.kcs ? String(r.kcs).split("|") : [],
+			tags: r.tags ? String(r.tags).split("|") : [],
+			source: r.source,
+			status: r.status,
+			created_at: r.created_at,
+			updated_at: r.updated_at
+			}));
+		}
+
+		if (scope === "all") {
+			// attempts
+			const { results: attempts } = await env.DB.prepare(
+			`SELECT attempt_id,user_id,item_id,ts,elapsed_sec,raw_answer,correct,attempts,work_url,process_json,rubric_json,eval_model,device_id,session_id
+			FROM attempts`
+			).all();
+			out.attempts = (attempts as any[]).map(r => ({
+			attempt_id: r.attempt_id,
+			user_id: r.user_id,
+			item_id: r.item_id,
+			ts: r.ts,
+			elapsed_sec: r.elapsed_sec,
+			raw_answer: r.raw_answer ? JSON.parse(r.raw_answer) : null,
+			correct: r.correct,
+			attempts: r.attempts,
+			work_url: r.work_url,
+			process_json: r.process_json ? JSON.parse(r.process_json) : null,
+			rubric_json: r.rubric_json ? JSON.parse(r.rubric_json) : null,
+			eval_model: r.eval_model,
+			device_id: r.device_id,
+			session_id: r.session_id
+			}));
+
+			// kc_stats
+			const { results: stats } = await env.DB.prepare(
+			`SELECT user_id,kc,w,correct_rate,total_attempts,correct_attempts,streak,last_ts FROM kc_stats`
+			).all();
+			out.kc_stats = stats;
+		}
+
+		const key = "backup:items:latest";
+		const text = JSON.stringify(out);
+		await kv.put(key, text, { expirationTtl: 60 * 60 * 24 * 30 }); // 保存 30 天（可調整）
+
+		return { key, bytes: text.length, counts: {
+			items: out.items.length,
+			attempts: Array.isArray(out.attempts) ? out.attempts.length : 0,
+			kc_stats: Array.isArray(out.kc_stats) ? out.kc_stats.length : 0
+		}};
+	}
+
+	/* ---------- 管理端：手動備份 ---------- */
+	if (url.pathname === "/api/admin/backup" && req.method === "POST") {
+		if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+		try {
+			const body = await req.json().catch(()=>({}));
+			const scope: "items"|"all" = body.scope === "all" ? "all" : "items";
+			const res = await backupToKV(env, scope);
+			return j({ ok: true, scope, key: res.key, counts: res.counts, bytes: res.bytes }, 200, origin);
+		} catch (e:any) {
+			return j({ error: "backup_failed", detail: String(e?.message || e) }, 500, origin);
+		}
+	}
+
+	/* ---------- 管理端：下載最新備份 ---------- */
+	if (url.pathname === "/api/admin/backup/latest" && req.method === "GET") {
+		if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+		try {
+			const kv = env.AFTERCLASS_KV ?? env.KV;
+			if (!kv) return j({ error: "no_kv_binding" }, 500, origin);
+			const text = await kv.get("backup:items:latest");
+			if (!text) return j({ error: "not_found" }, 404, origin);
+			return new Response(text, {
+			status: 200,
+			headers: {
+				"Content-Type": "application/json; charset=utf-8",
+				"Content-Disposition": `attachment; filename="afterclass-backup-latest.json"`,
+				...corsHeaders(origin)
+			}
+			});
+		} catch (e:any) {
+			return j({ error: "backup_download_failed", detail: String(e?.message || e) }, 500, origin);
+		}
+	}
+
+	/* ---------- 管理端：清空題庫（先自動備份） ---------- */
+	if (url.pathname === "/api/admin/purge" && req.method === "POST") {
+		if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+		try {
+			const body = await req.json().catch(() => ({}));
+			const today = new Date().toISOString().slice(0, 10);
+			if (body.confirm !== today) {
+				return j({ error: "confirm_required", hint: today }, 400, origin);
+			}
+
+			// 先備份（只保留一份最新）
+			const backup = await backupToKV(env, body.scope === "all" ? "all" : "items");
+
+			// 再清空
+			await env.DB.prepare("DELETE FROM attempts").run();
+			await env.DB.prepare("DELETE FROM kc_stats").run();
+			await env.DB.prepare("DELETE FROM items").run();
+
+			return j({ ok: true, backup, cleared: ["items", "attempts", "kc_stats"] }, 200, origin);
+		} catch (e: any) {
+			return j({ error: "purge_failed", detail: String(e?.message || e) }, 500, origin);
+		}
+	}
+	  
       // POST /api/attempts/bulk
       if (url.pathname === "/api/attempts/bulk" && req.method === "POST") {
         if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
