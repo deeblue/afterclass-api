@@ -203,12 +203,85 @@ async function gptEvaluate(env: Env, prompt: string, preferStrong = false, maxTo
   };
 }
 
+/* ----------------------- DB bootstrap (ensure tables) ----------------------- */
+async function ensureExtraTables(env: Env) {
+  await env.DB.batch([
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS item_issues (
+        id TEXT PRIMARY KEY,
+        item_id TEXT NOT NULL,
+        user_id TEXT,
+        session_id TEXT,
+        ts TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        note TEXT,
+        raw_answer TEXT,
+        correct INTEGER
+      )
+    `),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_item_issues_item_ts ON item_issues(item_id, ts DESC)`),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS item_revisions (
+        rev_id TEXT PRIMARY KEY,
+        item_id TEXT NOT NULL,
+        ts TEXT NOT NULL,
+        editor TEXT,
+        before_json TEXT NOT NULL,
+        after_json  TEXT NOT NULL
+      )
+    `),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_item_revisions_item_ts ON item_revisions(item_id, ts DESC)`)
+  ]);
+}
+
+/* ----------------------- Suspicious quarantine helpers ----------------------- */
+const QUARANTINE_N = 30;
+const QUARANTINE_MIN_N = 20;
+const QUARANTINE_RATE = 0.10;   // < 10%
+const QUARANTINE_ISSUES_24H = 3;
+
+async function getItemRecentStats(env: Env, item_id: string) {
+  // last N attempts
+  const attempts = await env.DB.prepare(`
+    SELECT correct FROM attempts
+    WHERE item_id=?
+    ORDER BY ts DESC
+    LIMIT ?
+  `).bind(item_id, QUARANTINE_N).all<any>();
+
+  const arr = (attempts.results as any[]).map(r => Number(r.correct ? 1 : 0));
+  const n = arr.length;
+  const correct = arr.reduce((a, b) => a + b, 0);
+  const rate = n ? correct / n : 0;
+
+  // issues in last 24h
+  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const issues = await env.DB.prepare(`
+    SELECT COUNT(*) AS c FROM item_issues
+    WHERE item_id=? AND ts>=?
+  `).bind(item_id, since).first<any>();
+  const issues24h = Number(issues?.c ?? 0);
+
+  return { n, rate, issues24h };
+}
+
+async function checkAndQuarantineItem(env: Env, item_id: string) {
+  const { n, rate, issues24h } = await getItemRecentStats(env, item_id);
+  if ((n >= QUARANTINE_MIN_N && rate < QUARANTINE_RATE) || (issues24h >= QUARANTINE_ISSUES_24H)) {
+    await env.DB.prepare(`UPDATE items SET status='needs_review' WHERE id=? AND status!='retired'`).bind(item_id).run();
+    return { quarantined: true, n, rate, issues24h };
+  }
+  return { quarantined: false, n, rate, issues24h };
+}
 
 /* ----------------------- Main router ----------------------- */
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const origin = pickOrigin(env.ALLOW_ORIGIN, req.headers.get("Origin"));
     try {
+      // 確保新增表存在（惰性建立）
+      await ensureExtraTables(env);
+
       const url = new URL(req.url);
 
       if (req.method === "OPTIONS") return no(origin);
@@ -370,34 +443,6 @@ export default {
 `科目=${subject}，年級=${grade}，單元=${unit}。
 請從下圖擷取題目為 JSON（最多 10 題）。`;
 
-        //   async function callVision(model: string) {
-        //     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-        //       method: "POST",
-        //       headers: {
-        //         "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
-        //         "Content-Type": "application/json"
-        //       },
-        //       body: JSON.stringify({
-        //         model,
-        //         temperature: 0.0,
-        //         response_format: { type: "json_object" },
-        //         messages: [
-        //           { role: "system", content: sys },
-        //           {
-        //             role: "user",
-        //             content: [
-        //               { type: "text", text: userText },
-        //               { type: "image_url", image_url: { url: dataUrl } }
-        //             ]
-        //           }
-        //         ]
-        //       })
-        //     });
-        //     const data = await resp.json();
-        //     const raw = data?.choices?.[0]?.message?.content ?? "";
-        //     return { raw, model, usage: data?.usage };
-        //   }
-
 		async function callVision(env: Env, model: string, dataUrl: string, userText: string, sys: string) {
 		const r = await fetch("https://api.openai.com/v1/chat/completions", {
 			method: "POST",
@@ -435,18 +480,15 @@ export default {
 			error: !ok ? (payload?.error || { message: "unknown_error" }) : null
 		};
 		}
+    
+    // 先 mini，再視情況升級 4o
+    const firstModel = preferStrong ? "gpt-4o" : "gpt-4o-mini";
 
-          // 先 mini，再視情況升級 4o
-          const firstModel = preferStrong ? "gpt-4o" : "gpt-4o-mini";
-        //   let out = await callVision(firstModel);
-        //   if (!out.raw || out.raw.trim() === "" || out.raw.trim() === "{}") {
-        //     out = await callVision("gpt-4o");
-        //   }
 		  let out = await callVision(env, firstModel, dataUrl, userText, sys);
 		  if (!out.ok) {
-			const fallback = await callVision(env, "gpt-4o", dataUrl, userText, sys);
-			// 若 fallback OK 就用 fallback；否則仍用第一次但帶出錯誤
-			if (fallback.ok) out = fallback; else out = { ...out, model: firstModel, fallback_error: fallback.error, fallback_status: fallback.status };
+			  const fallback = await callVision(env, "gpt-4o", dataUrl, userText, sys);
+			  // 若 fallback OK 就用 fallback；否則仍用第一次但帶出錯誤
+			  if (fallback.ok) out = fallback; else out = { ...out, model: firstModel, fallback_error: fallback.error, fallback_status: fallback.status };
 		  }
 
 
@@ -475,13 +517,13 @@ export default {
           return j({
             count: items.length,
             items,
-            model: out.model,
+            model: firstModel,
             usage: out.usage ?? null,
             raw: out.raw,                 // 方便前端「顯示模型原始回應」
-			oai_status: out.status,
-			oai_error: out.error || null,
-			fallback_status: (out as any).fallback_status || null,
-			fallback_error: (out as any).fallback_error || null,
+			      oai_status: out.status,
+            oai_error: out.error || null,
+            fallback_status: (out as any).fallback_status || null,
+            fallback_error: (out as any).fallback_error || null,
             duration_ms: Date.now() - start
           }, 200, origin);
         } catch (e: any) {
@@ -524,6 +566,7 @@ export default {
                 choices=excluded.choices, answer=excluded.answer, solution=excluded.solution,
                 difficulty=excluded.difficulty, kcs=excluded.kcs, tags=excluded.tags,
                 source=excluded.source, status=excluded.status
+                updated_at=datetime('now')
             `).bind(
               id, subject, grade, unit, item_type, stem, choicesJson, answerJson, solution,
               difficulty, kcs, tags, source, status
@@ -673,7 +716,214 @@ export default {
 			return j({ error: "purge_failed", detail: String(e?.message || e) }, 500, origin);
 		}
 	}
+
+    /* ----------------------- NEW: Issue reporting & review queue ----------------------- */
+
+    // POST /api/items/issues  —— 學生/監考回報題目有問題
+    if (url.pathname === "/api/items/issues" && req.method === "POST") {
+      // 視需求放寬驗證。此處沿用 bearerOk。
+      if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+      try {
+        const body = await req.json().catch(()=> ({}));
+        const id = crypto.randomUUID();
+        const item_id = String(body.item_id || "");
+        const reason = String(body.reason || "other");
+        const note = nvl(body.note != null ? String(body.note) : null);
+        const raw_answer = nvl(body.raw_answer != null ? JSON.stringify(body.raw_answer) : null);
+        const correct = Number(body.correct ?? null);
+        const user_id = nvl(body.user_id != null ? String(body.user_id) : null);
+        const session_id = nvl(body.session_id != null ? String(body.session_id) : null);
+        const ts = new Date().toISOString();
+
+        if (!item_id) return j({ error: "missing_item_id" }, 400, origin);
+
+        await env.DB.prepare(`
+          INSERT INTO item_issues (id, item_id, user_id, session_id, ts, reason, note, raw_answer, correct)
+          VALUES (?,?,?,?,?,?,?,?,?)
+        `).bind(id, item_id, user_id, session_id, ts, reason, note, raw_answer, isFinite(correct) ? correct : null).run();
+
+        // 回報累積檢查：若過多則 quarantine
+        await checkAndQuarantineItem(env, item_id);
+
+        return j({ ok: true, id }, 200, origin);
+      } catch (e:any) {
+        return j({ error: "issue_create_failed", detail: String(e?.message || e) }, 500, origin);
+      }
+    }
+
+    // GET /api/admin/items/issues?item_id=...&since=...&limit=50
+    if (url.pathname === "/api/admin/items/issues" && req.method === "GET") {
+      if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+      try {
+        const item_id = String(url.searchParams.get("item_id") || "");
+        if (!item_id) return j({ error: "missing_item_id" }, 400, origin);
+        const since = url.searchParams.get("since") || "1970-01-01T00:00:00.000Z";
+        const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") || 50)));
+
+        const { results } = await env.DB.prepare(`
+          SELECT id, item_id, user_id, session_id, ts, reason, note, raw_answer, correct
+          FROM item_issues
+          WHERE item_id=? AND ts>=?
+          ORDER BY ts DESC
+          LIMIT ?
+        `).bind(item_id, since, limit).all();
+
+        const rows = (results as any[]).map(r => ({
+          id: r.id,
+          item_id: r.item_id,
+          user_id: r.user_id,
+          session_id: r.session_id,
+          ts: r.ts,
+          reason: r.reason,
+          note: r.note,
+          raw_answer: r.raw_answer ? JSON.parse(r.raw_answer) : null,
+          correct: (r.correct == null ? null : Number(r.correct))
+        }));
+
+        return j({ count: rows.length, issues: rows }, 200, origin);
+      } catch (e:any) {
+        return j({ error: "issues_fetch_failed", detail: String(e?.message || e) }, 500, origin);
+      }
+    }
+
+      // GET /api/admin/items/review-queue?limit=50
+      if (url.pathname === "/api/admin/items/review-queue" && req.method === "GET") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        try {
+          const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") || 50)));
+          const { results } = await env.DB.prepare(`
+            SELECT * FROM items WHERE status='needs_review'
+            ORDER BY updated_at DESC NULLS LAST, created_at DESC
+            LIMIT ?
+          `).bind(limit).all();
+
+          const items = [];
+          for (const r of (results as any[])) {
+            const item_id = r.id;
+            const base: any = {
+              id: r.id, subject: r.subject, grade: r.grade, unit: r.unit,
+              kcs: r.kcs ? String(r.kcs).split("|") : [],
+              item_type: r.item_type, difficulty: r.difficulty,
+              stem: r.stem,
+              choices: r.choices ? JSON.parse(r.choices) : null,
+              solution: r.solution,
+              tags: r.tags ? String(r.tags).split("|") : [],
+              source: r.source, status: r.status
+            };
+
+            const { n, rate, issues24h } = await getItemRecentStats(env, item_id);
+
+            // 取最近 3 筆回報
+            const lastIssues = await env.DB.prepare(`
+              SELECT id, ts, reason, note, correct
+              FROM item_issues
+              WHERE item_id=?
+              ORDER BY ts DESC
+              LIMIT 3
+            `).bind(item_id).all<any>();
+
+            items.push({
+              item: base,
+              stats: { recent_n: n, recent_correct_rate: rate, issues_24h: issues24h },
+              last_issues: (lastIssues.results as any[]).map(ir => ({
+                id: ir.id, ts: ir.ts, reason: ir.reason, note: ir.note, correct: ir.correct
+              }))
+            });
+          }
+
+          return j({ count: items.length, items }, 200, origin);
+        } catch (e:any) {
+          return j({ error: "review_queue_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
+
+      // PUT /api/items/:id —— 管理端修訂題目（寫入 item_revisions）
+      if (url.pathname.startsWith("/api/items/") && req.method === "PUT") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        try {
+          const id = url.pathname.split("/").pop()!;
+          const patch = await req.json().catch(()=> ({}));
+
+          // 取舊
+          const oldRow = await env.DB.prepare(`SELECT * FROM items WHERE id=?`).bind(id).first<any>();
+          if (!oldRow) return j({ error: "not_found" }, 404, origin);
+
+          const before = {
+            id: oldRow.id,
+            subject: oldRow.subject, grade: oldRow.grade, unit: oldRow.unit,
+            item_type: oldRow.item_type, difficulty: oldRow.difficulty,
+            stem: oldRow.stem,
+            choices: oldRow.choices ? JSON.parse(oldRow.choices) : null,
+            answer:  oldRow.answer  ? JSON.parse(oldRow.answer)  : null,
+            solution: oldRow.solution,
+            kcs: oldRow.kcs ? String(oldRow.kcs).split("|") : [],
+            tags: oldRow.tags ? String(oldRow.tags).split("|") : [],
+            source: oldRow.source, status: oldRow.status
+          };
+
+          // 合併新值
+          const subject = patch.subject ?? before.subject;
+          const grade = patch.grade ?? before.grade;
+          const unit = patch.unit ?? before.unit;
+          const item_type = patch.item_type ?? before.item_type;
+          const difficulty = Number(patch.difficulty ?? before.difficulty);
+          const stem = patch.stem ?? before.stem;
+          const choices = (patch.choices !== undefined) ? patch.choices : before.choices;
+          const answer  = (patch.answer  !== undefined) ? patch.answer  : before.answer;
+          const solution = patch.solution ?? before.solution;
+          const kcsArr = Array.isArray(patch.kcs) ? patch.kcs : before.kcs;
+          const tagsArr = Array.isArray(patch.tags) ? patch.tags : before.tags;
+          const source = patch.source ?? before.source;
+          const status = patch.status ?? before.status;
+
+          if (!stem) return j({ error: "missing_stem" }, 400, origin);
+          const allowed = ["single","multiple","numeric","text","cloze","ordering","matching","tablefill","truefalse"];
+          if (!allowed.includes(item_type)) return j({ error: "bad_item_type" }, 400, origin);
+
+          // 更新
+          await env.DB.prepare(`
+            UPDATE items SET
+              subject=?, grade=?, unit=?, item_type=?, difficulty=?,
+              stem=?, choices=?, answer=?, solution=?,
+              kcs=?, tags=?, source=?, status=?, updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+          `).bind(
+            subject, grade, unit, item_type, difficulty,
+            String(stem), choices != null ? JSON.stringify(choices) : null,
+            answer  != null ? JSON.stringify(answer)  : null,
+            String(solution ?? ""),
+            Array.isArray(kcsArr) ? kcsArr.join("|") : "",
+            Array.isArray(tagsArr) ? tagsArr.join("|") : "",
+            String(source ?? "manual"),
+            String(status ?? "published"),
+            id
+          ).run();
+
+          // 寫修訂
+          const after = {
+            id,
+            subject, grade, unit, item_type, difficulty, stem, choices, answer, solution,
+            kcs: Array.isArray(kcsArr) ? kcsArr : [],
+            tags: Array.isArray(tagsArr) ? tagsArr : [],
+            source, status
+          };
+          const rev_id = crypto.randomUUID();
+          const editor = patch.editor ?? "admin";
+          await env.DB.prepare(`
+            INSERT INTO item_revisions (rev_id, item_id, ts, editor, before_json, after_json)
+            VALUES (?,?,?,?,?,?)
+          `).bind(
+            rev_id, id, new Date().toISOString(), String(editor),
+            JSON.stringify(before), JSON.stringify(after)
+          ).run();
+
+          return j({ ok: true, id, rev_id }, 200, origin);
+        } catch (e:any) {
+          return j({ error: "item_update_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }    
 	  
+      /* ----------------------- Attempts bulk (with quarantine) ----------------------- */
       // POST /api/attempts/bulk
       if (url.pathname === "/api/attempts/bulk" && req.method === "POST") {
         if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
@@ -689,6 +939,7 @@ export default {
 
           let inserted = 0, updated = 0, duplicates = 0;
           const failures: Array<{ i:number; reason:string }> = [];
+          const touched = new Set<string>();
 
           for (let i = 0; i < attemptsIn.length; i++) {
             const a = attemptsIn[i];
@@ -765,10 +1016,17 @@ export default {
                   }
                 }
               }
+
+              touched.add(item_id);
             } catch (e: any) {
               failures.push({ i, reason: String(e?.message || e) });
             }
           }
+
+          // 批次後再針對每個被觸及的 item 檢查是否需要 quarantine
+          for (const item_id of touched) {
+            try { await checkAndQuarantineItem(env, item_id); } catch {}
+          }          
 
           const payload = { inserted, updated, duplicates, failures };
           return j(payload, failures.length ? 207 : 200, origin); // 207: Multi-Status
