@@ -36,7 +36,7 @@ function pickOrigin(allowList: string, reqOrigin: string | null): string {
 
 const corsHeaders = (o: string) => ({
   "Access-Control-Allow-Origin": o,
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS,PUT",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
   "Access-Control-Max-Age": "86400",
 });
@@ -50,10 +50,11 @@ const j = (data: unknown, status = 200, o = "*") =>
 const no = (o: string) => new Response(null, { status: 204, headers: corsHeaders(o) });
 
 function bearerOk(req: Request, env: Env): boolean {
-//   if (!env.API_BEARER) return true; // if no bearer configured, skip auth
-//   const auth = req.headers.get("Authorization") || "";
-//   return auth === `Bearer ${env.API_BEARER}`;
-	return true;
+  // 若要開放匿名，改成 true
+  // if (!env.API_BEARER) return true;
+  // const auth = req.headers.get("Authorization") || "";
+  // return auth === `Bearer ${env.API_BEARER}`;
+  return true;
 }
 
 /** super-simple KV rate limit: N reqs per ttlSec per key */
@@ -133,7 +134,7 @@ function grade(raw: any, correctAns: Answer): number {
         const pairs = Array.isArray(raw?.pairs) ? raw.pairs : [];
         const norm = (p: [string, string]) => `${normStr(p[0])}=>${normStr(p[1])}`;
         const a = pairs.map(norm).sort();
-        const b = correctAns.pairs.map(norm).sort();
+        const b = (correctAns.pairs || []).map(norm).sort();
         return JSON.stringify(a) === JSON.stringify(b) ? 1 : 0;
       }
       case "tablefill": {
@@ -153,7 +154,7 @@ function grade(raw: any, correctAns: Answer): number {
   return 0;
 }
 
-/* ----------------------- GPT helper for process eval ----------------------- */
+/* ----------------------- GPT helpers ----------------------- */
 async function gptEvaluate(env: Env, prompt: string, preferStrong = false, maxTokens = 500) {
   if (!env.OPENAI_API_KEY) {
     return {
@@ -193,14 +194,31 @@ async function gptEvaluate(env: Env, prompt: string, preferStrong = false, maxTo
       if (o.verdict !== "uncertain" && (o.confidence ?? 0.5) >= 0.6) {
         return { model, text: last };
       }
-    } catch {
-      // escalate
-    }
+    } catch { /* escalate */ }
   }
   return {
     model: preferStrong ? "gpt-4o" : "gpt-4o-mini",
     text: last || JSON.stringify({ verdict: "uncertain", reasoning: "模型未返回有效 JSON", confidence: 0 })
   };
+}
+
+/* ---------- small normalization for math text ---------- */
+function normalizeMathText(s: string): string {
+  return String(s || "")
+    .replace(/\u2212/g, "-")      // − → -
+    .replace(/[–—]/g, "-")        // – — → -
+    .replace(/[×✕]/g, "\\times")  // ×/✕ → \times
+    .replace(/·/g, "\\cdot")
+    .replace(/\u00B2/g, "^2")
+    .replace(/\u00B3/g, "^3")
+    .replace(/\u2070/g, "^0")
+    .replace(/\u2074/g, "^4")
+    .replace(/\u221A/g, "\\sqrt")
+    .replace(/\u2264/g, "\\le")
+    .replace(/\u2265/g, "\\ge")
+    .replace(/\u2260/g, "\\ne")
+    .replace(/\u00B1/g, "\\pm")
+    .trim();
 }
 
 /* ----------------------- DB bootstrap (ensure tables) ----------------------- */
@@ -234,19 +252,16 @@ async function ensureExtraTables(env: Env) {
   ]);
 }
 
-/* ----------------------- Suspicious quarantine helpers ----------------------- */
+/* ----------------------- Quarantine helpers ----------------------- */
 const QUARANTINE_N = 30;
 const QUARANTINE_MIN_N = 20;
 const QUARANTINE_RATE = 0.10;   // < 10%
 const QUARANTINE_ISSUES_24H = 3;
 
 async function getItemRecentStats(env: Env, item_id: string) {
-  // last N attempts
   const attempts = await env.DB.prepare(`
     SELECT correct FROM attempts
-    WHERE item_id=?
-    ORDER BY ts DESC
-    LIMIT ?
+    WHERE item_id=? ORDER BY ts DESC LIMIT ?
   `).bind(item_id, QUARANTINE_N).all<any>();
 
   const arr = (attempts.results as any[]).map(r => Number(r.correct ? 1 : 0));
@@ -254,7 +269,6 @@ async function getItemRecentStats(env: Env, item_id: string) {
   const correct = arr.reduce((a, b) => a + b, 0);
   const rate = n ? correct / n : 0;
 
-  // issues in last 24h
   const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
   const issues = await env.DB.prepare(`
     SELECT COUNT(*) AS c FROM item_issues
@@ -274,16 +288,54 @@ async function checkAndQuarantineItem(env: Env, item_id: string) {
   return { quarantined: false, n, rate, issues24h };
 }
 
+/* ---------- OpenAI Vision generic caller ---------- */
+async function callVision(env: Env, model: string, sys: string, userText: string, imageDataUrl: string) {
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.0,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: sys },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: userText },
+            { type: "image_url", image_url: { url: imageDataUrl } }
+          ]
+        }
+      ]
+    })
+  });
+
+  let payload: any = null;
+  try { payload = await r.json(); } catch { payload = null; }
+
+  const ok = r.ok && payload?.choices?.[0]?.message?.content;
+  return {
+    ok,
+    status: r.status,
+    payload,
+    raw: ok ? payload.choices[0].message.content : "",
+    usage: payload?.usage || null,
+    error: !ok ? (payload?.error || { message: "unknown_error" }) : null,
+    model
+  };
+}
+
 /* ----------------------- Main router ----------------------- */
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const origin = pickOrigin(env.ALLOW_ORIGIN, req.headers.get("Origin"));
     try {
-      // 確保新增表存在（惰性建立）
       await ensureExtraTables(env);
 
       const url = new URL(req.url);
-
       if (req.method === "OPTIONS") return no(origin);
 
       // health
@@ -359,7 +411,7 @@ export default {
         }
       }
 
-      // POST /api/grade   (check correctness without leaking official answer)
+      // POST /api/grade
       if (url.pathname === "/api/grade" && req.method === "POST") {
         if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
         try {
@@ -385,9 +437,7 @@ export default {
 
       /* ---------- POST /api/ingest/vision (OpenAI Vision) ---------- */
       if (url.pathname === "/api/ingest/vision" && req.method === "POST") {
-        // 若要完全開放，改成：不檢查 bearerOk
         if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
-
         try {
           const start = Date.now();
           const body = await req.json().catch(() => ({}));
@@ -397,16 +447,12 @@ export default {
           const unit: string = String(body.unit || "unsorted");
           const preferStrong = url.searchParams.get("strong") === "1";
 
-          if (!env.OPENAI_API_KEY) {
-            return j({ error: "no_openai_key" }, 500, origin);
-          }
+          if (!env.OPENAI_API_KEY) return j({ error: "no_openai_key" }, 500, origin);
           if (!dataUrl.startsWith("data:image/")) {
             return j({ error: "bad_image_data_url", hint: "請傳 data:image/png;base64,..." }, 400, origin);
           }
 
-          // Prompt：要求輸出 { items: [...] }
-          const sys =
-`你是國中數學題目擷取器。從圖片擷取「最多 10 題」獨立題目，輸出 JSON 物件：
+          const sys = `你是國中數學題目擷取器。從圖片擷取「最多 10 題」獨立題目，輸出 JSON 物件：
 {
   "items": [
     {
@@ -439,88 +485,38 @@ export default {
 - 請勿在 stem 出現裁切殘字；解析度不足就保守略過該題。
 - 僅輸出 JSON，不要多餘文字。`;
 
-          const userText =
-`科目=${subject}，年級=${grade}，單元=${unit}。
-請從下圖擷取題目為 JSON（最多 10 題）。`;
+          const userText = `科目=${subject}，年級=${grade}，單元=${unit}。請從下圖擷取題目為 JSON（最多 10 題）。`;
 
-		async function callVision(env: Env, model: string, dataUrl: string, userText: string, sys: string) {
-		const r = await fetch("https://api.openai.com/v1/chat/completions", {
-			method: "POST",
-			headers: {
-			"Authorization": `Bearer ${env.OPENAI_API_KEY}`,
-			"Content-Type": "application/json"
-			},
-			body: JSON.stringify({
-			model,
-			temperature: 0.0,
-			response_format: { type: "json_object" },
-			messages: [
-				{ role: "system", content: sys },
-				{
-				role: "user",
-				content: [
-					{ type: "text", text: userText },
-					{ type: "image_url", image_url: { url: dataUrl } }
-				]
-				}
-			]
-			})
-		});
-
-		let payload: any = null;
-		try { payload = await r.json(); } catch { payload = null; }
-
-		const ok = r.ok && payload?.choices?.[0]?.message?.content;
-		return {
-			ok,
-			status: r.status,
-			payload,
-			raw: ok ? payload.choices[0].message.content : "",
-			usage: payload?.usage || null,
-			error: !ok ? (payload?.error || { message: "unknown_error" }) : null
-		};
-		}
-    
-    // 先 mini，再視情況升級 4o
-    const firstModel = preferStrong ? "gpt-4o" : "gpt-4o-mini";
-
-		  let out = await callVision(env, firstModel, dataUrl, userText, sys);
-		  if (!out.ok) {
-			  const fallback = await callVision(env, "gpt-4o", dataUrl, userText, sys);
-			  // 若 fallback OK 就用 fallback；否則仍用第一次但帶出錯誤
-			  if (fallback.ok) out = fallback; else out = { ...out, model: firstModel, fallback_error: fallback.error, fallback_status: fallback.status };
-		  }
-
+          const firstModel = preferStrong ? "gpt-4o" : "gpt-4o-mini";
+          let out = await callVision(env, firstModel, sys, userText, dataUrl);
+          if (!out.ok) {
+            const fb = await callVision(env, "gpt-4o", sys, userText, dataUrl);
+            if (fb.ok) out = fb; else out = { ...out, fallback_status: fb.status, fallback_error: fb.error };
+          }
 
           let parsed: any = {};
           try { parsed = JSON.parse(out.raw); } catch { parsed = {}; }
           let items = Array.isArray(parsed?.items) ? parsed.items : [];
-
-          // 後處理：補齊 subject/grade/unit、限制長度、確保欄位型別
-          items = items
-            .map((it: any) => ({
-              id: it?.id ?? crypto.randomUUID(),
-              subject,
-              grade,
-              unit,
-              item_type: String(it?.item_type ?? "single"),
-              difficulty: Number(it?.difficulty ?? 2),
-              stem: String(it?.stem ?? "").slice(0, 4000),
-              choices: it?.choices ?? null,
-              answer: it?.answer ?? null,
-              solution: typeof it?.solution === "string" ? it.solution : "",
-              kcs: Array.isArray(it?.kcs) ? it.kcs : [],
-              tags: Array.isArray(it?.tags) ? it.tags : []
-            }))
-            .filter((it: any) => it.stem);
+          items = items.map((it: any) => ({
+            id: it?.id ?? crypto.randomUUID(),
+            subject, grade, unit,
+            item_type: String(it?.item_type ?? "single"),
+            difficulty: Number(it?.difficulty ?? 2),
+            stem: String(it?.stem ?? "").slice(0, 4000),
+            choices: it?.choices ?? null,
+            answer: it?.answer ?? null,
+            solution: typeof it?.solution === "string" ? it.solution : "",
+            kcs: Array.isArray(it?.kcs) ? it.kcs : [],
+            tags: Array.isArray(it?.tags) ? it.tags : []
+          })).filter((it: any) => it.stem);
 
           return j({
             count: items.length,
             items,
-            model: firstModel,
+            model: out.model,
             usage: out.usage ?? null,
-            raw: out.raw,                 // 方便前端「顯示模型原始回應」
-			      oai_status: out.status,
+            raw: out.raw,
+            oai_status: out.status,
             oai_error: out.error || null,
             fallback_status: (out as any).fallback_status || null,
             fallback_error: (out as any).fallback_error || null,
@@ -531,7 +527,148 @@ export default {
         }
       }
 
-      // POST /api/items/upsert  (bulk upsert)
+      /* ---------- NEW: POST /api/process/eval-vision  (two-stage: transcribe -> structure+grade) ---------- */
+      if (url.pathname === "/api/process/eval-vision" && req.method === "POST") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+        if (!(await rateLimit(env, `evalv:${ip}`, 60, 60))) return j({ error: "rate_limited" }, 429, origin);
+        try {
+          const start = Date.now();
+          const body = await req.json().catch(()=> ({}));
+          const item_id = body.item_id ? String(body.item_id) : null;
+          const stem = String(body.stem ?? "");
+          const solution = String(body.solution ?? "");
+          const img = String(body.workpad_image_data_url || body.image_data_url || "");
+          const preferStrong = !!body?.policy?.strong;
+
+          if (!env.OPENAI_API_KEY) return j({ error: "no_openai_key" }, 500, origin);
+          if (!img.startsWith("data:image/")) return j({ error: "bad_image_data_url" }, 400, origin);
+
+          // --- (A) Transcribe system ---
+          const sysTranscribe = `
+你是嚴格的數學轉錄器。任務僅限「忠實抄寫」影像中的手寫/印刷內容為 LaTeX 與純文字兩種格式。
+規則：
+- 不推理、不補步驟、不糾錯；看見什麼就抄什麼。
+- 盡可能逐行列出，保持原始順序與符號。
+- 將特殊符號正確表達：±, ∴, √, ≈, ≠, ≤, ≥, ∠, ∘, ², ³ 等。
+- 分數用 \\frac{a}{b}，冪次 a^{2}，下標 a_{i}，根號 \\sqrt{...}。
+- 變數與乘號區分清楚：字母 x 與乘號 \\times 或 \\cdot 不可混用。
+- 絕對值 |x|。
+- 僅輸出 JSON：{ "lines": [{ "latex": "...", "text": "..." }...], "confidence": 0.0-1.0 }
+          `.trim();
+
+          const userTranscribe = `從下圖轉錄內容，保持原始順序與格式。不推理不改寫。`;
+
+          // call mini → fallback 4o
+          const m1 = preferStrong ? "gpt-4o" : "gpt-4o-mini";
+          let tOut = await callVision(env, m1, sysTranscribe, userTranscribe, img);
+          if (!tOut.ok) {
+            const fb = await callVision(env, "gpt-4o", sysTranscribe, userTranscribe, img);
+            if (fb.ok) tOut = fb; else tOut = { ...tOut, fallback_status: fb.status, fallback_error: fb.error };
+          }
+
+          let transcript: any = { lines: [], confidence: 0 };
+          try { transcript = JSON.parse(tOut.raw || "{}"); } catch {}
+          if (!Array.isArray(transcript.lines)) transcript.lines = [];
+          transcript.lines = transcript.lines.map((ln: any) => ({
+            latex: normalizeMathText(ln?.latex ?? ""),
+            text: normalizeMathText(ln?.text ?? "")
+          }));
+          transcript.confidence = Math.max(0, Math.min(1, Number(transcript.confidence ?? 0)));
+
+          // --- (B) Structure + evaluate ---
+          const sysEval = `
+你是數學助教。根據「轉寫結果」與題幹（與可選的參考解），產生結構化步驟並評估。
+輸出 JSON：
+{
+  "steps": [
+    { "expr_latex": "...", "expr_text": "...", "op": "移項|展開|因式分解|化簡|代入|開根|取絕對值|其他", "comment": "..." }
+  ],
+  "verdict": "correct|incorrect|uncertain",
+  "reasoning": "簡述錯誤出在哪一步與原因",
+  "rubric": { "setup":0-1, "operations":0-1, "units":0-1, "presentation":0-1 },
+  "confidence": 0.0-1.0,
+  "first_error_step": 整數或 null
+}
+規則：
+- 先將轉寫的 lines 合理分組為 steps（若影像就是井然有序，steps 可對應 lines）。
+- 若提供了標準答案，優先比對；若無標準答案，請自行求解作為參考，但評估以學生步驟合理性為主。
+- 低信心時回 "uncertain" 並指出需要人工覆核的區段。
+          `.trim();
+
+          const userEval =
+`題幹：
+${stem}
+
+（可選）參考解：
+${solution || "無"}
+
+轉寫結果（請以此為唯一依據，不可自行改寫）：
+${JSON.stringify(transcript)}`;
+
+          const m2 = preferStrong ? "gpt-4o" : "gpt-4o-mini";
+          const rEval = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: { "Authorization": `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: m2,
+              temperature: 0.2,
+              response_format: { type: "json_object" },
+              messages: [
+                { role: "system", content: sysEval },
+                { role: "user", content: userEval }
+              ],
+              max_tokens: 800
+            })
+          });
+
+          let ePayload: any = null;
+          try { ePayload = await rEval.json(); } catch {}
+          let eRaw = rEval.ok ? (ePayload?.choices?.[0]?.message?.content ?? "") : "";
+          // fallback to 4o if mini failed or empty
+          if (!rEval.ok || !eRaw) {
+            const rEval2 = await fetch("https://api.openai.com/v1/chat/completions", {
+              method: "POST",
+              headers: { "Authorization": `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
+              body: JSON.stringify({
+                model: "gpt-4o",
+                temperature: 0.2,
+                response_format: { type: "json_object" },
+                messages: [
+                  { role: "system", content: sysEval },
+                  { role: "user", content: userEval }
+                ],
+                max_tokens: 900
+              })
+            });
+            try { ePayload = await rEval2.json(); } catch {}
+            eRaw = rEval2.ok ? (ePayload?.choices?.[0]?.message?.content ?? "") : eRaw;
+          }
+
+          let result: any = {};
+          try { result = JSON.parse(eRaw || "{}"); } catch { result = {}; }
+          if (Array.isArray(result?.steps)) {
+            result.steps = result.steps.map((s: any) => ({
+              expr_latex: normalizeMathText(s?.expr_latex ?? ""),
+              expr_text: normalizeMathText(s?.expr_text ?? ""),
+              op: s?.op || "其他",
+              comment: s?.comment || ""
+            }));
+          }
+
+          return j({
+            transcript,                 // { lines[], confidence }
+            result,                     // { steps[], verdict, rubric, ... }
+            models: { transcribe: tOut.model, evaluate: ePayload?.model || m2 },
+            usage: { transcribe: tOut.usage || null, evaluate: ePayload?.usage || null },
+            duration_ms: Date.now() - start
+          }, 200, origin);
+        } catch (e:any) {
+          return j({ error: "eval_vision_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
+
+      // POST /api/items/upsert (bulk upsert)
       if (url.pathname === "/api/items/upsert" && req.method === "POST") {
         if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
         try {
@@ -565,7 +702,7 @@ export default {
                 item_type=excluded.item_type, stem=excluded.stem,
                 choices=excluded.choices, answer=excluded.answer, solution=excluded.solution,
                 difficulty=excluded.difficulty, kcs=excluded.kcs, tags=excluded.tags,
-                source=excluded.source, status=excluded.status
+                source=excluded.source, status=excluded.status,
                 updated_at=datetime('now')
             `).bind(
               id, subject, grade, unit, item_type, stem, choicesJson, answerJson, solution,
@@ -580,213 +717,203 @@ export default {
         }
       }
 
-	/* ----------------------- Backup ----------------------- */
-	async function backupToKV(env: Env, scope: "items"|"all" = "items") {
-		const kv = env.AFTERCLASS_KV ?? env.KV;
-		if (!kv) throw new Error("KV not bound");
+      /* ----------------------- Backup/Download/Purge ----------------------- */
+      async function backupToKV(env: Env, scope: "items"|"all" = "items") {
+        const kv = env.AFTERCLASS_KV ?? env.KV;
+        if (!kv) throw new Error("KV not bound");
 
-		const out: any = {
-			schema: "afterclass-backup.v1",
-			scope,
-			created_at: new Date().toISOString(),
-			items: [] as any[],
-		};
+        const out: any = {
+          schema: "afterclass-backup.v1",
+          scope,
+          created_at: new Date().toISOString(),
+          items: [] as any[],
+        };
 
-		// items
-		{
-			const { results } = await env.DB.prepare(
-			`SELECT id,subject,grade,unit,item_type,stem,choices,answer,solution,difficulty,kcs,tags,source,status,created_at,updated_at
-			FROM items`
-			).all();
-			out.items = (results as any[]).map(r => ({
-			id: r.id,
-			subject: r.subject,
-			grade: r.grade,
-			unit: r.unit,
-			item_type: r.item_type,
-			stem: r.stem,
-			choices: r.choices ? JSON.parse(r.choices) : null,
-			answer:  r.answer  ? JSON.parse(r.answer)  : null,
-			solution: r.solution,
-			difficulty: r.difficulty,
-			kcs: r.kcs ? String(r.kcs).split("|") : [],
-			tags: r.tags ? String(r.tags).split("|") : [],
-			source: r.source,
-			status: r.status,
-			created_at: r.created_at,
-			updated_at: r.updated_at
-			}));
-		}
+        // items
+        {
+          const { results } = await env.DB.prepare(
+            `SELECT id,subject,grade,unit,item_type,stem,choices,answer,solution,difficulty,kcs,tags,source,status,created_at,updated_at
+             FROM items`
+          ).all();
+          out.items = (results as any[]).map(r => ({
+            id: r.id,
+            subject: r.subject,
+            grade: r.grade,
+            unit: r.unit,
+            item_type: r.item_type,
+            stem: r.stem,
+            choices: r.choices ? JSON.parse(r.choices) : null,
+            answer:  r.answer  ? JSON.parse(r.answer)  : null,
+            solution: r.solution,
+            difficulty: r.difficulty,
+            kcs: r.kcs ? String(r.kcs).split("|") : [],
+            tags: r.tags ? String(r.tags).split("|") : [],
+            source: r.source,
+            status: r.status,
+            created_at: r.created_at,
+            updated_at: r.updated_at
+          }));
+        }
 
-		if (scope === "all") {
-			// attempts
-			const { results: attempts } = await env.DB.prepare(
-			`SELECT attempt_id,user_id,item_id,ts,elapsed_sec,raw_answer,correct,attempts,work_url,process_json,rubric_json,eval_model,device_id,session_id
-			FROM attempts`
-			).all();
-			out.attempts = (attempts as any[]).map(r => ({
-			attempt_id: r.attempt_id,
-			user_id: r.user_id,
-			item_id: r.item_id,
-			ts: r.ts,
-			elapsed_sec: r.elapsed_sec,
-			raw_answer: r.raw_answer ? JSON.parse(r.raw_answer) : null,
-			correct: r.correct,
-			attempts: r.attempts,
-			work_url: r.work_url,
-			process_json: r.process_json ? JSON.parse(r.process_json) : null,
-			rubric_json: r.rubric_json ? JSON.parse(r.rubric_json) : null,
-			eval_model: r.eval_model,
-			device_id: r.device_id,
-			session_id: r.session_id
-			}));
+        if (scope === "all") {
+          const { results: attempts } = await env.DB.prepare(
+            `SELECT attempt_id,user_id,item_id,ts,elapsed_sec,raw_answer,correct,attempts,work_url,process_json,rubric_json,eval_model,device_id,session_id
+             FROM attempts`
+          ).all();
+          out.attempts = (attempts as any[]).map(r => ({
+            attempt_id: r.attempt_id,
+            user_id: r.user_id,
+            item_id: r.item_id,
+            ts: r.ts,
+            elapsed_sec: r.elapsed_sec,
+            raw_answer: r.raw_answer ? JSON.parse(r.raw_answer) : null,
+            correct: r.correct,
+            attempts: r.attempts,
+            work_url: r.work_url,
+            process_json: r.process_json ? JSON.parse(r.process_json) : null,
+            rubric_json: r.rubric_json ? JSON.parse(r.rubric_json) : null,
+            eval_model: r.eval_model,
+            device_id: r.device_id,
+            session_id: r.session_id
+          }));
 
-			// kc_stats
-			const { results: stats } = await env.DB.prepare(
-			`SELECT user_id,kc,w,correct_rate,total_attempts,correct_attempts,streak,last_ts FROM kc_stats`
-			).all();
-			out.kc_stats = stats;
-		}
+          const { results: stats } = await env.DB.prepare(
+            `SELECT user_id,kc,w,correct_rate,total_attempts,correct_attempts,streak,last_ts FROM kc_stats`
+          ).all();
+          out.kc_stats = stats;
+        }
 
-		const key = "backup:items:latest";
-		const text = JSON.stringify(out);
-		await kv.put(key, text, { expirationTtl: 60 * 60 * 24 * 30 }); // 保存 30 天（可調整）
-
-		return { key, bytes: text.length, counts: {
-			items: out.items.length,
-			attempts: Array.isArray(out.attempts) ? out.attempts.length : 0,
-			kc_stats: Array.isArray(out.kc_stats) ? out.kc_stats.length : 0
-		}};
-	}
-
-	/* ---------- 管理端：手動備份 ---------- */
-	if (url.pathname === "/api/admin/backup" && req.method === "POST") {
-		if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
-		try {
-			const body = await req.json().catch(()=>({}));
-			const scope: "items"|"all" = body.scope === "all" ? "all" : "items";
-			const res = await backupToKV(env, scope);
-			return j({ ok: true, scope, key: res.key, counts: res.counts, bytes: res.bytes }, 200, origin);
-		} catch (e:any) {
-			return j({ error: "backup_failed", detail: String(e?.message || e) }, 500, origin);
-		}
-	}
-
-	/* ---------- 管理端：下載最新備份 ---------- */
-	if (url.pathname === "/api/admin/backup/latest" && req.method === "GET") {
-		if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
-		try {
-			const kv = env.AFTERCLASS_KV ?? env.KV;
-			if (!kv) return j({ error: "no_kv_binding" }, 500, origin);
-			const text = await kv.get("backup:items:latest");
-			if (!text) return j({ error: "not_found" }, 404, origin);
-			return new Response(text, {
-			status: 200,
-			headers: {
-				"Content-Type": "application/json; charset=utf-8",
-				"Content-Disposition": `attachment; filename="afterclass-backup-latest.json"`,
-				...corsHeaders(origin)
-			}
-			});
-		} catch (e:any) {
-			return j({ error: "backup_download_failed", detail: String(e?.message || e) }, 500, origin);
-		}
-	}
-
-	/* ---------- 管理端：清空題庫（先自動備份） ---------- */
-	if (url.pathname === "/api/admin/purge" && req.method === "POST") {
-		if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
-		try {
-			const body = await req.json().catch(() => ({}));
-			const today = new Date().toISOString().slice(0, 10);
-			if (body.confirm !== today) {
-				return j({ error: "confirm_required", hint: today }, 400, origin);
-			}
-
-			// 先備份（只保留一份最新）
-			const backup = await backupToKV(env, body.scope === "all" ? "all" : "items");
-
-			// 再清空
-			await env.DB.prepare("DELETE FROM attempts").run();
-			await env.DB.prepare("DELETE FROM kc_stats").run();
-			await env.DB.prepare("DELETE FROM items").run();
-
-			return j({ ok: true, backup, cleared: ["items", "attempts", "kc_stats"] }, 200, origin);
-		} catch (e: any) {
-			return j({ error: "purge_failed", detail: String(e?.message || e) }, 500, origin);
-		}
-	}
-
-    /* ----------------------- NEW: Issue reporting & review queue ----------------------- */
-
-    // POST /api/items/issues  —— 學生/監考回報題目有問題
-    if (url.pathname === "/api/items/issues" && req.method === "POST") {
-      // 視需求放寬驗證。此處沿用 bearerOk。
-      if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
-      try {
-        const body = await req.json().catch(()=> ({}));
-        const id = crypto.randomUUID();
-        const item_id = String(body.item_id || "");
-        const reason = String(body.reason || "other");
-        const note = nvl(body.note != null ? String(body.note) : null);
-        const raw_answer = nvl(body.raw_answer != null ? JSON.stringify(body.raw_answer) : null);
-        const correct = Number(body.correct ?? null);
-        const user_id = nvl(body.user_id != null ? String(body.user_id) : null);
-        const session_id = nvl(body.session_id != null ? String(body.session_id) : null);
-        const ts = new Date().toISOString();
-
-        if (!item_id) return j({ error: "missing_item_id" }, 400, origin);
-
-        await env.DB.prepare(`
-          INSERT INTO item_issues (id, item_id, user_id, session_id, ts, reason, note, raw_answer, correct)
-          VALUES (?,?,?,?,?,?,?,?,?)
-        `).bind(id, item_id, user_id, session_id, ts, reason, note, raw_answer, isFinite(correct) ? correct : null).run();
-
-        // 回報累積檢查：若過多則 quarantine
-        await checkAndQuarantineItem(env, item_id);
-
-        return j({ ok: true, id }, 200, origin);
-      } catch (e:any) {
-        return j({ error: "issue_create_failed", detail: String(e?.message || e) }, 500, origin);
+        const key = "backup:items:latest";
+        const text = JSON.stringify(out);
+        await kv.put(key, text, { expirationTtl: 60 * 60 * 24 * 30 });
+        return {
+          key, bytes: text.length, counts: {
+            items: out.items.length,
+            attempts: Array.isArray(out.attempts) ? out.attempts.length : 0,
+            kc_stats: Array.isArray(out.kc_stats) ? out.kc_stats.length : 0
+          }
+        };
       }
-    }
 
-    // GET /api/admin/items/issues?item_id=...&since=...&limit=50
-    if (url.pathname === "/api/admin/items/issues" && req.method === "GET") {
-      if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
-      try {
-        const item_id = String(url.searchParams.get("item_id") || "");
-        if (!item_id) return j({ error: "missing_item_id" }, 400, origin);
-        const since = url.searchParams.get("since") || "1970-01-01T00:00:00.000Z";
-        const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") || 50)));
-
-        const { results } = await env.DB.prepare(`
-          SELECT id, item_id, user_id, session_id, ts, reason, note, raw_answer, correct
-          FROM item_issues
-          WHERE item_id=? AND ts>=?
-          ORDER BY ts DESC
-          LIMIT ?
-        `).bind(item_id, since, limit).all();
-
-        const rows = (results as any[]).map(r => ({
-          id: r.id,
-          item_id: r.item_id,
-          user_id: r.user_id,
-          session_id: r.session_id,
-          ts: r.ts,
-          reason: r.reason,
-          note: r.note,
-          raw_answer: r.raw_answer ? JSON.parse(r.raw_answer) : null,
-          correct: (r.correct == null ? null : Number(r.correct))
-        }));
-
-        return j({ count: rows.length, issues: rows }, 200, origin);
-      } catch (e:any) {
-        return j({ error: "issues_fetch_failed", detail: String(e?.message || e) }, 500, origin);
+      // POST /api/admin/backup
+      if (url.pathname === "/api/admin/backup" && req.method === "POST") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        try {
+          const body = await req.json().catch(()=>({}));
+          const scope: "items"|"all" = body.scope === "all" ? "all" : "items";
+          const res = await backupToKV(env, scope);
+          return j({ ok: true, scope, key: res.key, counts: res.counts, bytes: res.bytes }, 200, origin);
+        } catch (e:any) {
+          return j({ error: "backup_failed", detail: String(e?.message || e) }, 500, origin);
+        }
       }
-    }
 
-      // GET /api/admin/items/review-queue?limit=50
+      // GET /api/admin/backup/latest
+      if (url.pathname === "/api/admin/backup/latest" && req.method === "GET") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        try {
+          const kv = env.AFTERCLASS_KV ?? env.KV;
+          if (!kv) return j({ error: "no_kv_binding" }, 500, origin);
+          const text = await kv.get("backup:items:latest");
+          if (!text) return j({ error: "not_found" }, 404, origin);
+          return new Response(text, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json; charset=utf-8",
+              "Content-Disposition": `attachment; filename="afterclass-backup-latest.json"`,
+              ...corsHeaders(origin)
+            }
+          });
+        } catch (e:any) {
+          return j({ error: "backup_download_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
+
+      // POST /api/admin/purge
+      if (url.pathname === "/api/admin/purge" && req.method === "POST") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        try {
+          const body = await req.json().catch(() => ({}));
+          const today = new Date().toISOString().slice(0, 10);
+          if (body.confirm !== today) {
+            return j({ error: "confirm_required", hint: today }, 400, origin);
+          }
+          const backup = await backupToKV(env, body.scope === "all" ? "all" : "items");
+          await env.DB.prepare("DELETE FROM attempts").run();
+          await env.DB.prepare("DELETE FROM kc_stats").run();
+          await env.DB.prepare("DELETE FROM items").run();
+          return j({ ok: true, backup, cleared: ["items", "attempts", "kc_stats"] }, 200, origin);
+        } catch (e: any) {
+          return j({ error: "purge_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
+
+      /* ----------------------- Issue reporting & review queue ----------------------- */
+
+      // POST /api/items/issues
+      if (url.pathname === "/api/items/issues" && req.method === "POST") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        try {
+          const body = await req.json().catch(()=> ({}));
+          const id = crypto.randomUUID();
+          const item_id = String(body.item_id || "");
+          const reason = String(body.reason || "other");
+          const note = nvl(body.note != null ? String(body.note) : null);
+          const raw_answer = nvl(body.raw_answer != null ? JSON.stringify(body.raw_answer) : null);
+          const correct = Number(body.correct ?? null);
+          const user_id = nvl(body.user_id != null ? String(body.user_id) : null);
+          const session_id = nvl(body.session_id != null ? String(body.session_id) : null);
+          const ts = new Date().toISOString();
+          if (!item_id) return j({ error: "missing_item_id" }, 400, origin);
+
+          await env.DB.prepare(`
+            INSERT INTO item_issues (id, item_id, user_id, session_id, ts, reason, note, raw_answer, correct)
+            VALUES (?,?,?,?,?,?,?,?,?)
+          `).bind(id, item_id, user_id, session_id, ts, reason, note, raw_answer, isFinite(correct) ? correct : null).run();
+
+          await checkAndQuarantineItem(env, item_id);
+          return j({ ok: true, id }, 200, origin);
+        } catch (e:any) {
+          return j({ error: "issue_create_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
+
+      // GET /api/admin/items/issues
+      if (url.pathname === "/api/admin/items/issues" && req.method === "GET") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        try {
+          const item_id = String(url.searchParams.get("item_id") || "");
+          if (!item_id) return j({ error: "missing_item_id" }, 400, origin);
+          const since = url.searchParams.get("since") || "1970-01-01T00:00:00.000Z";
+          const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") || 50)));
+
+          const { results } = await env.DB.prepare(`
+            SELECT id, item_id, user_id, session_id, ts, reason, note, raw_answer, correct
+            FROM item_issues
+            WHERE item_id=? AND ts>=?
+            ORDER BY ts DESC
+            LIMIT ?
+          `).bind(item_id, since, limit).all();
+
+          const rows = (results as any[]).map(r => ({
+            id: r.id,
+            item_id: r.item_id,
+            user_id: r.user_id,
+            session_id: r.session_id,
+            ts: r.ts,
+            reason: r.reason,
+            note: r.note,
+            raw_answer: r.raw_answer ? JSON.parse(r.raw_answer) : null,
+            correct: (r.correct == null ? null : Number(r.correct))
+          }));
+
+          return j({ count: rows.length, issues: rows }, 200, origin);
+        } catch (e:any) {
+          return j({ error: "issues_fetch_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
+
+      // GET /api/admin/items/review-queue
       if (url.pathname === "/api/admin/items/review-queue" && req.method === "GET") {
         if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
         try {
@@ -812,8 +939,6 @@ export default {
             };
 
             const { n, rate, issues24h } = await getItemRecentStats(env, item_id);
-
-            // 取最近 3 筆回報
             const lastIssues = await env.DB.prepare(`
               SELECT id, ts, reason, note, correct
               FROM item_issues
@@ -837,14 +962,13 @@ export default {
         }
       }
 
-      // PUT /api/items/:id —— 管理端修訂題目（寫入 item_revisions）
+      // PUT /api/items/:id
       if (url.pathname.startsWith("/api/items/") && req.method === "PUT") {
         if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
         try {
           const id = url.pathname.split("/").pop()!;
           const patch = await req.json().catch(()=> ({}));
 
-          // 取舊
           const oldRow = await env.DB.prepare(`SELECT * FROM items WHERE id=?`).bind(id).first<any>();
           if (!oldRow) return j({ error: "not_found" }, 404, origin);
 
@@ -861,7 +985,6 @@ export default {
             source: oldRow.source, status: oldRow.status
           };
 
-          // 合併新值
           const subject = patch.subject ?? before.subject;
           const grade = patch.grade ?? before.grade;
           const unit = patch.unit ?? before.unit;
@@ -880,7 +1003,6 @@ export default {
           const allowed = ["single","multiple","numeric","text","cloze","ordering","matching","tablefill","truefalse"];
           if (!allowed.includes(item_type)) return j({ error: "bad_item_type" }, 400, origin);
 
-          // 更新
           await env.DB.prepare(`
             UPDATE items SET
               subject=?, grade=?, unit=?, item_type=?, difficulty=?,
@@ -899,7 +1021,6 @@ export default {
             id
           ).run();
 
-          // 寫修訂
           const after = {
             id,
             subject, grade, unit, item_type, difficulty, stem, choices, answer, solution,
@@ -921,16 +1042,14 @@ export default {
         } catch (e:any) {
           return j({ error: "item_update_failed", detail: String(e?.message || e) }, 500, origin);
         }
-      }    
-	  
+      }
+
       /* ----------------------- Attempts bulk (with quarantine) ----------------------- */
-      // POST /api/attempts/bulk
       if (url.pathname === "/api/attempts/bulk" && req.method === "POST") {
         if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
         const ip = req.headers.get("CF-Connecting-IP") || "unknown";
         if (!(await rateLimit(env, `attempts:${ip}`, 180, 60))) return j({ error: "rate_limited" }, 429, origin);
 
-        const DEBUG = true;
         try {
           const body = await req.json().catch(() => ({}));
           const attemptsIn = Array.isArray(body.attempts) ? body.attempts : [];
@@ -1023,19 +1142,18 @@ export default {
             }
           }
 
-          // 批次後再針對每個被觸及的 item 檢查是否需要 quarantine
           for (const item_id of touched) {
             try { await checkAndQuarantineItem(env, item_id); } catch {}
-          }          
+          }
 
           const payload = { inserted, updated, duplicates, failures };
-          return j(payload, failures.length ? 207 : 200, origin); // 207: Multi-Status
+          return j(payload, failures.length ? 207 : 200, origin);
         } catch (e: any) {
           return j({ error: "attempts_bulk_failed", detail: String(e?.message || e) }, 500, origin);
         }
       }
 
-      // POST /api/process/eval (workpad step evaluation)
+      // POST /api/process/eval (JSON steps)
       if (url.pathname === "/api/process/eval" && req.method === "POST") {
         if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
         const ip = req.headers.get("CF-Connecting-IP") || "unknown";
@@ -1066,7 +1184,7 @@ ${JSON.stringify(steps)}
         }
       }
 
-      // POST /api/items (single create, admin)
+      // POST /api/items
       if (url.pathname === "/api/items" && req.method === "POST") {
         if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
         try {
