@@ -1153,6 +1153,103 @@ ${JSON.stringify(transcript)}`;
         }
       }
 
+      // POST /api/attempts/submit  (unified submit)
+      if (url.pathname === "/api/attempts/submit" && req.method === "POST") {
+        if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
+        const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+        if (!(await rateLimit(env, `submit:${ip}`, 120, 60))) return j({ error: "rate_limited" }, 429, origin);
+
+        try {
+          const body = await req.json().catch(() => ({}));
+          const item_id: string = String(body.item_id || "");
+          const user_id: string = String(body.user_id || "anon");
+          const raw_answer: any = body.raw_answer ?? null;
+
+          if (!item_id) return j({ error: "missing_item_id" }, 400, origin);
+          if (raw_answer == null) return j({ error: "missing_raw_answer" }, 400, origin);
+
+          // 1) 判答案（同步）
+          const row = await env.DB
+            .prepare(`SELECT answer FROM items WHERE id=? AND status='published'`)
+            .bind(item_id).first<any>();
+          if (!row?.answer) return j({ error: "answer_not_available" }, 404, origin);
+
+          const correctAns: Answer = JSON.parse(row.answer);
+          const isRight = grade(raw_answer, correctAns) ? 1 : 0;
+
+          // 2) 落庫（等同 attempts/bulk 的單筆）
+          const attempt_id = crypto.randomUUID();
+          const ts = new Date().toISOString();
+          const elapsed_sec = Number.isFinite(+body.elapsed_sec) ? +body.elapsed_sec : 0;
+
+          const process_json = body.process_json != null ? JSON.stringify(body.process_json) : null;
+          const rubric_json  = body.rubric_json  != null ? JSON.stringify(body.rubric_json)  : null;
+          const eval_model   = body.eval_model ? String(body.eval_model) : null;
+          const device_id    = body.device_id ? String(body.device_id) : null;
+          const session_id   = body.session_id ? String(body.session_id) : null;
+
+          await env.DB.prepare(
+            `INSERT INTO attempts
+            (attempt_id,user_id,item_id,ts,elapsed_sec,raw_answer,correct,attempts,work_url,process_json,rubric_json,eval_model,device_id,session_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+          ).bind(
+            attempt_id, user_id, item_id, ts, elapsed_sec,
+            JSON.stringify(raw_answer), Number(isRight), 1, null,
+            process_json, rubric_json, eval_model, device_id, session_id
+          ).run();
+
+          // 3)（可選）步驟評估：僅當 evaluate_steps=true 且提供了資料時執行
+          let step_eval: any = null;
+          const evaluateSteps = body.evaluate_steps === true;
+          const hasTextSteps = body.process_json && Object.keys(body.process_json || {}).length > 0;
+          const hasVision = typeof body.workpad_image_data_url === "string" && body.workpad_image_data_url.startsWith("data:image/");
+
+          if (evaluateSteps && (hasTextSteps || hasVision)) {
+            if (hasVision) {
+              // 用 vision 評估（影像型）
+              const r = await fetch(req.url.replace("/api/attempts/submit", "/api/process/eval-vision"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": req.headers.get("Authorization") || "" },
+                body: JSON.stringify({
+                  item_id,
+                  stem: body.stem || "",
+                  solution: body.solution || "",
+                  workpad_image_data_url: body.workpad_image_data_url,
+                  policy: body.policy || {}
+                })
+              });
+              step_eval = await r.json().catch(()=>null);
+            } else {
+              // 用 JSON 步驟評估（文字型）
+              const r = await fetch(req.url.replace("/api/attempts/submit", "/api/process/eval"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": req.headers.get("Authorization") || "" },
+                body: JSON.stringify({
+                  stem: body.stem || "",
+                  solution: body.solution || "",
+                  steps: body.process_json || {},
+                  policy: body.policy || {}
+                })
+              });
+              step_eval = await r.json().catch(()=>null);
+            }
+          }
+
+          return j({
+            ok: true,
+            attempt_id,
+            item_id,
+            correct: isRight,           // 立刻回答案判定
+            steps_evaluated: !!step_eval,
+            step_eval                   // 若有評估則回傳（包含 transcript/result 之類）
+          }, 200, origin);
+
+        } catch (e:any) {
+          return j({ error: "submit_failed", detail: String(e?.message || e) }, 500, origin);
+        }
+      }
+
+
       // POST /api/process/eval (JSON steps)
       if (url.pathname === "/api/process/eval" && req.method === "POST") {
         if (!bearerOk(req, env)) return j({ error: "unauthorized" }, 401, origin);
